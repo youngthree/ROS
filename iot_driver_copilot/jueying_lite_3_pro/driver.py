@@ -1,181 +1,168 @@
 import os
-import threading
-import io
+import asyncio
 import json
-import time
-import socket
-import struct
+import aiohttp
+from aiohttp import web
+import websockets
 import base64
 
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
+# Environment variables/config
+DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
+DEVICE_RTSP_PORT = int(os.environ.get("DEVICE_RTSP_PORT", "554"))
+DEVICE_ROSBRIDGE_PORT = int(os.environ.get("DEVICE_ROSBRIDGE_PORT", "9090"))
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+RTSP_STREAM_PATH = os.environ.get("RTSP_STREAM_PATH", "/video")  # e.g., /live/stream
+RTSP_USERNAME = os.environ.get("RTSP_USERNAME", "")
+RTSP_PASSWORD = os.environ.get("RTSP_PASSWORD", "")
 
-# Environment variable configuration
-DEVICE_IP = os.environ.get('DEVICE_IP', '127.0.0.1')
-DEVICE_ROS_UDP_PORT = int(os.environ.get('DEVICE_ROS_UDP_PORT', '15003'))
-DEVICE_RTSP_URL = os.environ.get('DEVICE_RTSP_URL', f'rtsp://{DEVICE_IP}:8554/live')
-HTTP_SERVER_HOST = os.environ.get('HTTP_SERVER_HOST', '0.0.0.0')
-HTTP_SERVER_PORT = int(os.environ.get('HTTP_SERVER_PORT', '8080'))
+# ROSBridge websocket URL
+ROSBRIDGE_URI = f"ws://{DEVICE_IP}:{DEVICE_ROSBRIDGE_PORT}"
 
-# For demonstration, we use UDP for status data and movement commands.
-# In real settings, you would use ROS libraries, but only sockets and stdlib are allowed.
+routes = web.RouteTableDef()
 
-# Simple UDP helper for sending commands and receiving status
-def send_udp_command(command_dict):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+async def rosbridge_call(service, args=None):
+    async with websockets.connect(ROSBRIDGE_URI) as ws:
+        call_id = "call_" + str(os.urandom(8).hex())
+        request = {
+            "op": "call_service",
+            "service": service,
+            "args": args or {},
+            "id": call_id,
+        }
+        await ws.send(json.dumps(request))
+        async for msg in ws:
+            resp = json.loads(msg)
+            if resp.get("id") == call_id and resp.get("op") == "service_response":
+                return resp.get("values", {})
+    return {}
+
+async def rosbridge_publish(topic, msg_type, msg):
+    async with websockets.connect(ROSBRIDGE_URI) as ws:
+        request = {
+            "op": "publish",
+            "topic": topic,
+            "msg": msg,
+        }
+        await ws.send(json.dumps(request))
+        # Don't wait for response, fire and forget
+
+async def rosbridge_subscribe(topic, msg_type, count=1):
+    async with websockets.connect(ROSBRIDGE_URI) as ws:
+        sub_id = "sub_" + str(os.urandom(8).hex())
+        request = {
+            "op": "subscribe",
+            "topic": topic,
+            "type": msg_type,
+            "id": sub_id,
+        }
+        await ws.send(json.dumps(request))
+        results = []
+        for _ in range(count):
+            msg = await ws.recv()
+            resp = json.loads(msg)
+            if resp.get("topic") == topic:
+                results.append(resp.get("msg"))
+        unsub_req = {"op": "unsubscribe", "id": sub_id, "topic": topic}
+        await ws.send(json.dumps(unsub_req))
+        return results
+
+@routes.post('/task')
+async def manage_task(request):
+    data = await request.json()
+    action = data.get('action')
+    script_type = data.get('script_type')
+    # Example: start/stop SLAM, LiDAR, Navigation
+    # Let's assume custom ROS services: /start_script, /stop_script
+    if action not in ['start', 'stop'] or not script_type:
+        return web.json_response({'error': 'Invalid payload'}, status=400)
+    service = f"/{action}_script"
+    args = {"script_type": script_type}
     try:
-        message = json.dumps(command_dict).encode('utf-8')
-        sock.sendto(message, (DEVICE_IP, DEVICE_ROS_UDP_PORT))
-        sock.settimeout(1.0)
-        try:
-            data, _ = sock.recvfrom(65536)
-            return json.loads(data.decode('utf-8'))
-        except socket.timeout:
-            return {"success": False, "error": "No response from device"}
-    finally:
-        sock.close()
+        resp = await rosbridge_call(service, args)
+        return web.json_response({"result": "ok", "response": resp})
+    except Exception as e:
+        return web.json_response({'error': str(e)}, status=500)
 
-# A simple RTSP->MJPEG over HTTP proxy
-import cv2
-import numpy as np
+@routes.get('/status')
+async def get_status(request):
+    # Example: subscribe once to sensor topics
+    out = {}
+    try:
+        # Localization
+        loc = await rosbridge_subscribe('/localization', 'geometry_msgs/PoseWithCovarianceStamped', 1)
+        # Navigation status
+        nav = await rosbridge_subscribe('/navigation_status', 'std_msgs/String', 1)
+        # IMU
+        imu = await rosbridge_subscribe('/imu', 'sensor_msgs/Imu', 1)
+        # Odom
+        odom = await rosbridge_subscribe('/odom', 'nav_msgs/Odometry', 1)
+        out = {
+            "localization": loc[0] if loc else {},
+            "navigation_status": nav[0] if nav else {},
+            "imu": imu[0] if imu else {},
+            "odom": odom[0] if odom else {},
+        }
+    except Exception as e:
+        return web.json_response({'error': str(e)}, status=500)
+    return web.json_response(out)
 
-class StreamProxy(threading.Thread):
-    def __init__(self, rtsp_url):
-        super().__init__()
-        self.rtsp_url = rtsp_url
-        self.frame = None
-        self.running = False
-        self.lock = threading.Lock()
+@routes.post('/move')
+async def move(request):
+    data = await request.json()
+    # Move command e.g. { "linear": { "x": 0.5, "y": 0, "z": 0 }, "angular": { "z": 0.2 } }
+    try:
+        await rosbridge_publish('/cmd_vel', 'geometry_msgs/Twist', data)
+        return web.json_response({"result": "ok"})
+    except Exception as e:
+        return web.json_response({'error': str(e)}, status=500)
 
-    def run(self):
-        self.running = True
-        cap = cv2.VideoCapture(self.rtsp_url)
-        if not cap.isOpened():
-            self.running = False
-            return
-        while self.running:
+@routes.get('/video')
+async def video_proxy(request):
+    """
+    HTTP MJPEG proxy for RTSP stream, accessible from browser.
+    """
+    import cv2
+
+    # Build RTSP URI
+    if RTSP_USERNAME and RTSP_PASSWORD:
+        auth = f"{RTSP_USERNAME}:{RTSP_PASSWORD}@"
+    else:
+        auth = ""
+    rtsp_url = f"rtsp://{auth}{DEVICE_IP}:{DEVICE_RTSP_PORT}{RTSP_STREAM_PATH}"
+
+    cap = cv2.VideoCapture(rtsp_url)
+    if not cap.isOpened():
+        return web.Response(status=503, text="Could not open RTSP stream")
+    response = web.StreamResponse(
+        status=200,
+        reason='OK',
+        headers={
+            'Content-Type': 'multipart/x-mixed-replace; boundary=frame'
+        }
+    )
+    await response.prepare(request)
+    try:
+        while True:
             ret, frame = cap.read()
             if not ret:
-                continue
-            with self.lock:
-                self.frame = frame
-        cap.release()
-
-    def get_frame(self):
-        with self.lock:
-            if self.frame is None:
-                return None
-            ret, jpeg = cv2.imencode('.jpg', self.frame)
+                break
+            ret, jpg = cv2.imencode('.jpg', frame)
             if not ret:
-                return None
-            return jpeg.tobytes()
-
-    def stop(self):
-        self.running = False
-
-stream_proxy = StreamProxy(DEVICE_RTSP_URL)
-stream_proxy.daemon = True
-stream_proxy.start()
-
-class DriverRequestHandler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        parsed_path = urlparse(self.path)
-        if parsed_path.path == '/task':
-            self.handle_task()
-        elif parsed_path.path == '/move':
-            self.handle_move()
-        else:
-            self.send_error(404, 'Not Found')
-
-    def do_GET(self):
-        parsed_path = urlparse(self.path)
-        if parsed_path.path == '/status':
-            self.handle_status()
-        elif parsed_path.path == '/video':
-            self.handle_video()
-        else:
-            self.send_error(404, 'Not Found')
-
-    def handle_task(self):
-        content_length = int(self.headers.get('Content-Length', 0))
-        raw_body = self.rfile.read(content_length)
-        try:
-            body = json.loads(raw_body.decode('utf-8'))
-        except Exception:
-            self.send_error(400, 'Invalid JSON')
-            return
-        # Translate to UDP command for the robot (action, script_type)
-        command = {
-            'type': 'task',
-            'action': body.get('action'),
-            'script_type': body.get('script_type')
-        }
-        result = send_udp_command(command)
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.end_headers()
-        self.wfile.write(json.dumps(result).encode('utf-8'))
-
-    def handle_move(self):
-        content_length = int(self.headers.get('Content-Length', 0))
-        raw_body = self.rfile.read(content_length)
-        try:
-            body = json.loads(raw_body.decode('utf-8'))
-        except Exception:
-            self.send_error(400, 'Invalid JSON')
-            return
-        # Translate to UDP command for the robot (velocity commands)
-        command = {
-            'type': 'move',
-            'cmd_vel': body.get('cmd_vel'),
-            'cmd_vel_corrected': body.get('cmd_vel_corrected')
-        }
-        result = send_udp_command(command)
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.end_headers()
-        self.wfile.write(json.dumps(result).encode('utf-8'))
-
-    def handle_status(self):
-        # Ask the robot for status data via UDP
-        command = {'type': 'status'}
-        result = send_udp_command(command)
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.end_headers()
-        self.wfile.write(json.dumps(result).encode('utf-8'))
-
-    def handle_video(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'multipart/x-mixed-replace; boundary=frame')
-        self.end_headers()
-        try:
-            while True:
-                frame = stream_proxy.get_frame()
-                if frame is None:
-                    time.sleep(0.1)
-                    continue
-                self.wfile.write(b'--frame\r\n')
-                self.send_header('Content-Type', 'image/jpeg')
-                self.send_header('Content-Length', str(len(frame)))
-                self.end_headers()
-                self.wfile.write(frame)
-                self.wfile.write(b'\r\n')
-                time.sleep(0.04)  # ~25fps
-        except Exception:
-            pass  # Client disconnected or error
-
-    def log_message(self, format, *args):
-        # Suppress default logging
-        return
-
-def run():
-    server = HTTPServer((HTTP_SERVER_HOST, HTTP_SERVER_PORT), DriverRequestHandler)
-    print(f"HTTP server running at http://{HTTP_SERVER_HOST}:{HTTP_SERVER_PORT}/")
-    try:
-        server.serve_forever()
+                continue
+            await response.write(b"--frame\r\n")
+            await response.write(b"Content-Type: image/jpeg\r\n\r\n")
+            await response.write(jpg.tobytes())
+            await response.write(b"\r\n")
+            await asyncio.sleep(0.04)  # ~25fps
+    except asyncio.CancelledError:
+        pass
     finally:
-        stream_proxy.stop()
+        cap.release()
+    return response
 
-if __name__ == '__main__':
-    run()
+app = web.Application()
+app.add_routes(routes)
+
+if __name__ == "__main__":
+    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
