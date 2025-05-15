@@ -1,114 +1,109 @@
 import os
 import io
-import cv2
-import time
+import asyncio
 import json
-import queue
 import base64
 import socket
 import struct
-import threading
-from flask import Flask, Response, request, jsonify, stream_with_context
+from typing import Optional
+from fastapi import FastAPI, Request, Response, BackgroundTasks, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
+import cv2
+import numpy as np
 
-# --- Environment Variables ---
-DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
-RTSP_URL = os.environ.get("RTSP_URL", f"rtsp://{DEVICE_IP}:8554/live")
-ROS_UDP_PORT = int(os.environ.get("ROS_UDP_PORT", "5555"))
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+# Configuration from environment variables
+ROBOT_IP = os.environ.get("DEVICE_IP", "192.168.1.100")
+ROS_BRIDGE_PORT = int(os.environ.get("ROS_BRIDGE_PORT", "9090"))
+UDP_PORT = int(os.environ.get("UDP_PORT", "5005"))
+RTSP_URL = os.environ.get("RTSP_URL", f"rtsp://{ROBOT_IP}/live")  # device-specific default
+HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
+HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8080"))
 
-# --- HTTP Server ---
-app = Flask(__name__)
+app = FastAPI()
 
-# -------- Video Stream (RTSP -> HTTP MJPEG) --------
-def generate_mjpeg(rtsp_url):
+# ---- Video Stream Proxy (RTSP -> HTTP MJPEG) ----
+
+def mjpeg_stream_from_rtsp(rtsp_url):
     cap = cv2.VideoCapture(rtsp_url)
     if not cap.isOpened():
-        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + b'' + b'\r\n')
-        return
+        raise HTTPException(status_code=502, detail="Could not connect to RTSP stream")
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
-                break
+                continue
             _, jpeg = cv2.imencode('.jpg', frame)
-            frame_bytes = jpeg.tobytes()
-            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            jpg_bytes = jpeg.tobytes()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + jpg_bytes + b'\r\n')
     finally:
         cap.release()
 
-@app.route('/video')
-def video_feed():
-    return Response(
-        stream_with_context(generate_mjpeg(RTSP_URL)),
-        mimetype='multipart/x-mixed-replace; boundary=frame'
-    )
+@app.get("/video")
+async def video_feed():
+    return StreamingResponse(mjpeg_stream_from_rtsp(RTSP_URL), media_type="multipart/x-mixed-replace; boundary=frame")
 
-# -------- UDP/ROS Bridge for Status --------
-status_data = {}
-udp_thread_running = threading.Event()
-udp_thread_running.set()
+# ---- UDP Status Proxy (fetch latest sensor/status over UDP) ----
 
-def udp_listener(status_data, port):
+def fetch_udp_status():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(('', port))
-    sock.settimeout(1.0)
-    while udp_thread_running.is_set():
+    sock.settimeout(2.0)
+    try:
+        # Protocol: Send a status request (customize as per device protocol)
+        status_req = b'status'
+        sock.sendto(status_req, (ROBOT_IP, UDP_PORT))
+        data, _ = sock.recvfrom(65536)
+        # Assume JSON encoded status over UDP
         try:
-            data, _ = sock.recvfrom(65535)
-            try:
-                msg = json.loads(data.decode('utf-8'))
-                status_data.clear()
-                status_data.update(msg)
-            except Exception:
-                continue
-        except socket.timeout:
-            continue
-    sock.close()
+            status_json = json.loads(data.decode())
+        except Exception:
+            status_json = {"raw": base64.b64encode(data).decode()}
+        return status_json
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        sock.close()
 
-udp_thread = threading.Thread(target=udp_listener, args=(status_data, ROS_UDP_PORT), daemon=True)
-udp_thread.start()
+@app.get("/status")
+async def get_status():
+    return JSONResponse(fetch_udp_status())
 
-@app.route('/status', methods=['GET'])
-def get_status():
-    # Return a basic status summary
-    return jsonify({
-        "status": "ok",
-        "data": status_data
-    })
+# ---- Movement Command Proxy (Send velocity command via UDP) ----
 
-# -------- POST /move: Send velocity commands (cmd_vel) --------
-def send_udp_command(payload, port):
+@app.post("/move")
+async def move_robot(request: Request):
+    payload = await request.json()
+    # Assume payload includes fields for velocity (linear, angular, etc.)
+    # The protocol below is illustrative; adapt to actual device command format
+    cmd = json.dumps(payload).encode()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    data = json.dumps(payload).encode('utf-8')
-    sock.sendto(data, (DEVICE_IP, port))
-    sock.close()
+    try:
+        sock.sendto(cmd, (ROBOT_IP, UDP_PORT))
+        return {"result": "command sent"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        sock.close()
 
-@app.route('/move', methods=['POST'])
-def move():
-    payload = request.get_json(force=True)
-    # Send as UDP for demonstration (normally via ROS topic)
-    send_udp_command({"cmd": "move", "payload": payload}, ROS_UDP_PORT)
-    return jsonify({"status": "sent", "payload": payload})
+# ---- Task Management Proxy (Start/Stop scripts via UDP) ----
 
-# -------- POST /task: Manage operational scripts --------
-@app.route('/task', methods=['POST'])
-def task():
-    req = request.get_json(force=True)
-    action = req.get("action", "").lower()
-    script_type = req.get("script_type", "").lower()
-    # Simulation: send to UDP or update status (no shell exec)
-    send_udp_command({"cmd": "task", "action": action, "script_type": script_type}, ROS_UDP_PORT)
-    return jsonify({"status": "ack", "action": action, "script_type": script_type})
+@app.post("/task")
+async def manage_task(request: Request):
+    payload = await request.json()
+    # Example: { "action": "start", "script": "slam" }
+    cmd = json.dumps({"task": payload}).encode()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.sendto(cmd, (ROBOT_IP, UDP_PORT))
+        return {"result": "task command sent"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        sock.close()
 
-# -------- Main --------
-def shutdown_server():
-    udp_thread_running.clear()
-    udp_thread.join()
+# ---- Main Entrypoint ----
 
 if __name__ == "__main__":
-    try:
-        app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
-    finally:
-        shutdown_server()
+    import uvicorn
+    uvicorn.run("driver:app", host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT, reload=False)
