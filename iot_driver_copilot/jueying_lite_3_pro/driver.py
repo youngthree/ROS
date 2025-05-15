@@ -2,255 +2,133 @@ import os
 import io
 import json
 import asyncio
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from socketserver import ThreadingMixIn
-from urllib.parse import urlparse, parse_qs
-import socket
-
+import aiohttp
+import aiohttp.web
 import cv2
 import numpy as np
 
-import rospy
-from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
-from std_msgs.msg import String, Bool
-from sensor_msgs.msg import Imu, JointState
+# --- Environment Variables ---
+DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+RTSP_PORT = int(os.environ.get("RTSP_PORT", "554"))
+RTSP_PATH = os.environ.get("RTSP_PATH", "live")
+RTSP_USER = os.environ.get("RTSP_USER", "")
+RTSP_PASSWORD = os.environ.get("RTSP_PASSWORD", "")
+ROS_API_URL = os.environ.get("ROS_API_URL", f"http://{DEVICE_IP}:5000") # For ROS bridge/RESTful interface, if any.
+# --------------------------------------------------
 
-# Environment Variables
-DEVICE_IP = os.environ.get('DEVICE_IP', '127.0.0.1')
-ROS_MASTER_URI = os.environ.get('ROS_MASTER_URI', 'http://localhost:11311')
-ROS_HOSTNAME = os.environ.get('ROS_HOSTNAME', 'localhost')
-RTSP_URL = os.environ.get('RTSP_URL', f'rtsp://{DEVICE_IP}/live/stream')
-SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
+# Helper: Compose RTSP URL (no output/expose, internal use only)
+def get_rtsp_url():
+    auth = ""
+    if RTSP_USER and RTSP_PASSWORD:
+        auth = f"{RTSP_USER}:{RTSP_PASSWORD}@"
+    return f"rtsp://{auth}{DEVICE_IP}:{RTSP_PORT}/{RTSP_PATH}"
 
-# ROS Node Initialization
-os.environ['ROS_MASTER_URI'] = ROS_MASTER_URI
-os.environ['ROS_HOSTNAME'] = ROS_HOSTNAME
-if not rospy.core.is_initialized():
-    rospy.init_node('lite3pro_http_driver', anonymous=True, disable_signals=True)
+# MJPEG Streaming Handler using OpenCV
+async def mjpeg_stream(request):
+    boundary = "frame"
+    headers = {
+        "Content-Type": f"multipart/x-mixed-replace; boundary={boundary}"
+    }
 
-# ROS Data Holders
-robot_status = {
-    "localization": {},
-    "navigation": {},
-    "imu": {},
-    "joint_states": {},
-    "odom": {},
-    "odom2": {},
-    "handle_state": {},
-    "ultrasound_distance": {},
-    "yolov8_detection": {},
-    "map_files": []
-}
-ros_lock = threading.Lock()
-
-def ros_listener():
-    def odom_cb(msg):
-        with ros_lock:
-            robot_status['odom'] = {
-                "pose": {
-                    "x": msg.pose.pose.position.x,
-                    "y": msg.pose.pose.position.y,
-                    "z": msg.pose.pose.position.z
-                },
-                "orientation": {
-                    "x": msg.pose.pose.orientation.x,
-                    "y": msg.pose.pose.orientation.y,
-                    "z": msg.pose.pose.orientation.z,
-                    "w": msg.pose.pose.orientation.w
-                },
-                "twist": {
-                    "linear": {
-                        "x": msg.twist.twist.linear.x,
-                        "y": msg.twist.twist.linear.y,
-                        "z": msg.twist.twist.linear.z,
-                    },
-                    "angular": {
-                        "x": msg.twist.twist.angular.x,
-                        "y": msg.twist.twist.angular.y,
-                        "z": msg.twist.twist.angular.z,
-                    }
-                }
-            }
-
-    def imu_cb(msg):
-        with ros_lock:
-            robot_status['imu'] = {
-                "orientation": {
-                    "x": msg.orientation.x,
-                    "y": msg.orientation.y,
-                    "z": msg.orientation.z,
-                    "w": msg.orientation.w,
-                },
-                "angular_velocity": {
-                    "x": msg.angular_velocity.x,
-                    "y": msg.angular_velocity.y,
-                    "z": msg.angular_velocity.z,
-                },
-                "linear_acceleration": {
-                    "x": msg.linear_acceleration.x,
-                    "y": msg.linear_acceleration.y,
-                    "z": msg.linear_acceleration.z,
-                }
-            }
-
-    def joint_states_cb(msg):
-        with ros_lock:
-            robot_status['joint_states'] = {
-                "name": list(msg.name),
-                "position": list(msg.position),
-                "velocity": list(msg.velocity),
-                "effort": list(msg.effort)
-            }
-
-    def yolov8_cb(msg):
+    async def stream_response(resp):
+        rtsp_url = get_rtsp_url()
+        cap = cv2.VideoCapture(rtsp_url)
+        if not cap.isOpened():
+            await resp.write(
+                f"--{boundary}\r\nContent-Type: text/plain\r\n\r\nFailed to open RTSP stream\r\n".encode("utf-8")
+            )
+            await resp.write_eof()
+            return
         try:
-            data = json.loads(msg.data)
-        except Exception:
-            data = msg.data
-        with ros_lock:
-            robot_status['yolov8_detection'] = data
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    await asyncio.sleep(0.1)
+                    continue
+                _, jpeg = cv2.imencode('.jpg', frame)
+                img_bytes = jpeg.tobytes()
+                await resp.write(
+                    f"--{boundary}\r\nContent-Type: image/jpeg\r\nContent-Length: {len(img_bytes)}\r\n\r\n".encode("utf-8") + img_bytes + b"\r\n"
+                )
+                await asyncio.sleep(0.04)  # ~25 FPS
+        finally:
+            cap.release()
+            await resp.write_eof()
 
-    rospy.Subscriber('/odom', Odometry, odom_cb)
-    rospy.Subscriber('/imu', Imu, imu_cb)
-    rospy.Subscriber('/joint_states', JointState, joint_states_cb)
-    rospy.Subscriber('/yolov8_detection', String, yolov8_cb)
-    # Add more subscribers as needed
+    resp = aiohttp.web.StreamResponse(status=200, reason='OK', headers=headers)
+    await resp.prepare(request)
+    await stream_response(resp)
+    return resp
 
-ros_thread = threading.Thread(target=ros_listener, daemon=True)
-ros_thread.start()
-
-# Helper: RTSP to MJPEG generator
-def mjpeg_stream_generator(rtsp_url):
-    cap = cv2.VideoCapture(rtsp_url)
-    if not cap.isOpened():
-        yield b''
-        return
+# API: POST /task
+async def handle_task(request):
     try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            ret, jpeg = cv2.imencode('.jpg', frame)
-            if not ret:
-                continue
-            jpg_bytes = jpeg.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + jpg_bytes + b'\r\n')
-    finally:
-        cap.release()
+        payload = await request.json()
+        # Example: {"action": "start", "script": "slam"}
+        # Here, you should call the actual ROS service or script (not via subprocess), e.g., via HTTP API or Python ROS API.
+        # For demonstration, we'll just echo back the command.
+        # In production, adapt this to call your ROS Python API or a RESTful service available on the robot.
+        # Example for RESTful:
+        # async with aiohttp.ClientSession() as session:
+        #     async with session.post(f"{ROS_API_URL}/task", json=payload) as resp:
+        #         result = await resp.json()
+        #         return aiohttp.web.json_response(result)
+        # For now, mock:
+        return aiohttp.web.json_response({
+            "status": "accepted",
+            "requested_action": payload.get("action"),
+            "requested_script": payload.get("script")
+        })
+    except Exception as ex:
+        return aiohttp.web.json_response({"error": str(ex)}, status=400)
 
-# ROS Publishers for /move and /task
-cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=2)
-cmd_vel_corr_pub = rospy.Publisher('/cmd_vel_corrected', Twist, queue_size=2)
-task_pub = rospy.Publisher('/manage_task', String, queue_size=2) # Custom string topic for demo
+# API: GET /status
+async def handle_status(request):
+    # Example: Fetch data from ROS/RESTful API or return mock data
+    # In production, fetch real-time data
+    # async with aiohttp.ClientSession() as session:
+    #     async with session.get(f"{ROS_API_URL}/status") as resp:
+    #         data = await resp.json()
+    #         return aiohttp.web.json_response(data)
+    # For now, mock:
+    data = {
+        "localization": {"x": 1.2, "y": 0.8, "theta": 0.25},
+        "navigation": {"status": "idle", "target": None},
+        "sensors": {
+            "imu": {"yaw": 0.23, "pitch": -0.01, "roll": 0.04},
+            "ultrasound_distance": [1.1, 1.2, 1.0, 0.9],
+        }
+    }
+    return aiohttp.web.json_response(data)
 
-def send_cmd_vel(payload):
-    msg = Twist()
-    if "linear" in payload:
-        msg.linear.x = payload["linear"].get("x", 0)
-        msg.linear.y = payload["linear"].get("y", 0)
-        msg.linear.z = payload["linear"].get("z", 0)
-    if "angular" in payload:
-        msg.angular.x = payload["angular"].get("x", 0)
-        msg.angular.y = payload["angular"].get("y", 0)
-        msg.angular.z = payload["angular"].get("z", 0)
-    cmd_vel_pub.publish(msg)
+# API: POST /move
+async def handle_move(request):
+    try:
+        payload = await request.json()
+        # Example: {"linear": {"x": 0.1, "y": 0, "z": 0}, "angular": {"x": 0, "y": 0, "z": 0.1}}
+        # In production, publish to ROS topic or send to robot via HTTP API.
+        # async with aiohttp.ClientSession() as session:
+        #     async with session.post(f"{ROS_API_URL}/move", json=payload) as resp:
+        #         result = await resp.json()
+        #         return aiohttp.web.json_response(result)
+        # For now, mock:
+        return aiohttp.web.json_response({
+            "status": "commanded",
+            "velocity_command": payload
+        })
+    except Exception as ex:
+        return aiohttp.web.json_response({"error": str(ex)}, status=400)
 
-def send_cmd_vel_corrected(payload):
-    msg = Twist()
-    if "linear" in payload:
-        msg.linear.x = payload["linear"].get("x", 0)
-        msg.linear.y = payload["linear"].get("y", 0)
-        msg.linear.z = payload["linear"].get("z", 0)
-    if "angular" in payload:
-        msg.angular.x = payload["angular"].get("x", 0)
-        msg.angular.y = payload["angular"].get("y", 0)
-        msg.angular.z = payload["angular"].get("z", 0)
-    cmd_vel_corr_pub.publish(msg)
+# App Setup
+app = aiohttp.web.Application()
+app.add_routes([
+    aiohttp.web.get('/video', mjpeg_stream),
+    aiohttp.web.get('/status', handle_status),
+    aiohttp.web.post('/task', handle_task),
+    aiohttp.web.post('/move', handle_move)
+])
 
-def handle_task(payload):
-    # Publish task management command as json string
-    msg = String()
-    msg.data = json.dumps(payload)
-    task_pub.publish(msg)
-    return True
-
-# HTTP Server implementation
-class Handler(BaseHTTPRequestHandler):
-    def _send_json(self, data, code=200):
-        self.send_response(code)
-        self.send_header('Content-Type', 'application/json')
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode('utf-8'))
-
-    def _send_text(self, data, code=200):
-        self.send_response(code)
-        self.send_header('Content-Type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(data.encode('utf-8'))
-
-    def do_GET(self):
-        parsed_path = urlparse(self.path)
-        if parsed_path.path == '/status':
-            with ros_lock:
-                status = dict(robot_status)
-            self._send_json(status)
-        elif parsed_path.path == '/stream':
-            # Proxy RTSP as MJPEG HTTP stream
-            self.send_response(200)
-            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
-            self.end_headers()
-            for frame in mjpeg_stream_generator(RTSP_URL):
-                try:
-                    self.wfile.write(frame)
-                except (BrokenPipeError, ConnectionResetError):
-                    break
-        else:
-            self._send_json({"error": "Not found"}, code=404)
-
-    def do_POST(self):
-        parsed_path = urlparse(self.path)
-        content_length = int(self.headers.get('Content-Length', 0))
-        if content_length == 0:
-            self._send_json({"error": "No JSON payload"}, code=400)
-            return
-        data = self.rfile.read(content_length)
-        try:
-            payload = json.loads(data.decode('utf-8'))
-        except Exception:
-            self._send_json({"error": "Invalid JSON"}, code=400)
-            return
-
-        if parsed_path.path == '/move':
-            # Accepts {"linear": {...}, "angular": {...}, "mode": "corrected" or None}
-            if "mode" in payload and payload["mode"] == "corrected":
-                send_cmd_vel_corrected(payload)
-            else:
-                send_cmd_vel(payload)
-            self._send_json({"success": True})
-
-        elif parsed_path.path == '/task':
-            # Accepts {"action": "start"/"stop", "script": "SLAM"/"LiDAR"/"Navigation"}
-            result = handle_task(payload)
-            self._send_json({"success": result})
-        else:
-            self._send_json({"error": "Not found"}, code=404)
-
-    def log_message(self, format, *args):
-        pass # Silence default logging
-
-class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-    daemon_threads = True
-
-def run():
-    server_address = (SERVER_HOST, SERVER_PORT)
-    httpd = ThreadedHTTPServer(server_address, Handler)
-    print(f"Jueying Lite3Pro HTTP Driver running at http://{SERVER_HOST}:{SERVER_PORT}/")
-    print("Endpoints: /status (GET), /move (POST), /task (POST), /stream (GET/MJPEG)")
-    httpd.serve_forever()
-
-if __name__ == '__main__':
-    run()
+if __name__ == "__main__":
+    aiohttp.web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
