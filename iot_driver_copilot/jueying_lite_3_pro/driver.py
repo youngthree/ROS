@@ -1,110 +1,107 @@
 import os
-import asyncio
+import io
 import json
-import base64
+import asyncio
+import threading
+from fastapi import FastAPI, Request, Response, BackgroundTasks
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel
+from typing import Any, Dict, Optional
+import uvicorn
+import requests
 import cv2
 import numpy as np
-from typing import Dict, Any
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
-import uvicorn
 
-# ======================= Environment Configuration =======================
-
+# Environment Variables
 DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
-ROS_MASTER_URI = os.environ.get("ROS_MASTER_URI", f"http://{DEVICE_IP}:11311")
-RTSP_URL = os.environ.get("RTSP_URL", f"rtsp://{DEVICE_IP}:8554/live")
+RTSP_PORT = int(os.environ.get("RTSP_PORT", "554"))
+RTSP_PATH = os.environ.get("RTSP_PATH", "live")
 HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
-HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", 8080))
-ROSBRIDGE_WS_URL = os.environ.get("ROSBRIDGE_WS_URL", f"ws://{DEVICE_IP}:9090")
+HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8000"))
+STATUS_API_PORT = int(os.environ.get("STATUS_API_PORT", "8080"))  # If REST API for status is on a different port
 
-# ======================= FastAPI App Setup =======================
+# RTSP URL construction (Jueying typically uses RTSP for video)
+RTSP_URL = f"rtsp://{DEVICE_IP}:{RTSP_PORT}/{RTSP_PATH}"
 
-app = FastAPI(title="Jueying Lite3 Pro Driver HTTP Server")
+app = FastAPI()
 
-# ======================= RTSP to HTTP MJPEG Stream =======================
+# ---- Models ----
 
-def mjpeg_stream(rtsp_url: str):
+class TaskCommand(BaseModel):
+    action: str  # 'start' or 'stop'
+    script_type: str  # 'SLAM', 'LiDAR', 'navigation', etc.
+
+class MoveCommand(BaseModel):
+    linear: Dict[str, float]  # e.g., {"x": 0.1, "y": 0.0, "z": 0.0}
+    angular: Dict[str, float]  # e.g., {"x": 0.0, "y": 0.0, "z": 0.1}
+
+# ---- Video Streaming ----
+
+def mjpeg_generator(rtsp_url: str):
     cap = cv2.VideoCapture(rtsp_url)
     if not cap.isOpened():
-        raise HTTPException(status_code=503, detail="Unable to connect to RTSP stream")
-    try:
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        _, jpeg = cv2.imencode('.jpg', frame)
+        while True:
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+    else:
         while True:
             ret, frame = cap.read()
             if not ret:
-                break
+                continue
             _, jpeg = cv2.imencode('.jpg', frame)
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-    finally:
-        cap.release()
 
-@app.get("/video", summary="HTTP-MJPEG proxy for RTSP video stream")
-async def video_stream():
-    return StreamingResponse(
-        mjpeg_stream(RTSP_URL),
-        media_type="multipart/x-mixed-replace; boundary=frame"
-    )
+@app.get("/video")
+def video_feed():
+    return StreamingResponse(mjpeg_generator(RTSP_URL), media_type="multipart/x-mixed-replace; boundary=frame")
 
-# ======================= ROS/Status API =======================
+# ---- Task Control ----
 
-# For demonstration: Simulate reading robot status data from ROS/UDP/JSON
-async def fetch_status() -> Dict[str, Any]:
-    # Here, you would use rospy or rosbridge websocket to get real data.
-    # We'll mock this for now.
-    return {
-        "localization": {"x": 1.23, "y": 4.56, "theta": 0.78},
-        "navigation": {"linear_vel": 0.1, "angular_vel": 0.01, "status": "idle"},
-        "imu": {"x": 0.2, "y": -0.1, "z": 9.8},
-        "joint_states": [{"name": "wheel_left", "pos": 0.5}, {"name": "wheel_right", "pos": 0.5}],
-        "ultrasound_distance": [1.2, 1.5, 1.4],
-        "handle_state": "neutral"
-    }
+@app.post("/task")
+async def manage_task(cmd: TaskCommand):
+    # Simulate or proxy to the device's API for script control
+    # e.g., HTTP POST to the device's API endpoint, or ROS topic publish
+    # Here we simulate a POST to a local REST API on the robot
+    # You may replace this with actual device communication logic
+    api_url = f"http://{DEVICE_IP}:{STATUS_API_PORT}/api/script"
+    try:
+        resp = requests.post(api_url, json={"action": cmd.action, "type": cmd.script_type}, timeout=3)
+        return JSONResponse(content=resp.json(), status_code=resp.status_code)
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
-@app.get("/status", summary="Fetch current status data including localization and navigation metrics")
+# ---- Status Monitor ----
+
+@app.get("/status")
 async def status():
-    data = await fetch_status()
-    return JSONResponse(content=data)
-
-# ======================= Move (cmd_vel) API =======================
-
-async def send_move_command(vel_data: Dict[str, Any]):
-    # Here you would publish to ROS (e.g., via rosbridge websocket or rospy)
-    # We'll simulate success for now.
-    return {"success": True, "sent_data": vel_data}
-
-@app.post("/move", summary="Send movement commands to the robot")
-async def move(request: Request):
+    # Simulate a GET to the device's status endpoint
+    api_url = f"http://{DEVICE_IP}:{STATUS_API_PORT}/api/status"
     try:
-        data = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-    result = await send_move_command(data)
-    return JSONResponse(content=result)
+        resp = requests.get(api_url, timeout=3)
+        return JSONResponse(content=resp.json(), status_code=resp.status_code)
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
-# ======================= Task Management API =======================
+# ---- Movement Control ----
 
-async def manage_task(action: str, script_type: str):
-    # Here you would start/stop scripts via ROS service/topic or SSH.
-    # We'll simulate.
-    if action not in ["start", "stop"]:
-        return {"success": False, "error": "Invalid action"}
-    return {"success": True, "action": action, "script_type": script_type}
-
-@app.post("/task", summary="Manage operational scripts such as SLAM, LiDAR, or navigation")
-async def task(request: Request):
+@app.post("/move")
+async def move(cmd: MoveCommand):
+    # Proxy movement command to the robot, e.g. via REST or ROS bridge
+    api_url = f"http://{DEVICE_IP}:{STATUS_API_PORT}/api/move"
+    payload = {
+        "linear": cmd.linear,
+        "angular": cmd.angular
+    }
     try:
-        data = await request.json()
-        action = data.get("action")
-        script_type = data.get("script_type")
-        if not (action and script_type):
-            raise ValueError()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Malformed JSON or missing required fields")
-    result = await manage_task(action, script_type)
-    return JSONResponse(content=result)
+        resp = requests.post(api_url, json=payload, timeout=3)
+        return JSONResponse(content=resp.json(), status_code=resp.status_code)
+    except Exception as e:
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
-# ======================= Main Entrypoint =======================
+# ---- Application Entrypoint ----
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT, reload=False)
+    uvicorn.run(app, host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT)
