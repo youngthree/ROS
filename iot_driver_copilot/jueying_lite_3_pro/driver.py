@@ -1,126 +1,106 @@
 import os
-import asyncio
 import json
-import uvicorn
-from fastapi import FastAPI, Request, Response, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
-from typing import Any, Dict
+import asyncio
 import aiohttp
+import aiohttp.web
+import cv2
+import numpy as np
 
-# Environment variables for config
-DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
-DEVICE_ROS_PORT = int(os.environ.get("DEVICE_ROS_PORT", "9090"))
-DEVICE_RTSP_PORT = int(os.environ.get("DEVICE_RTSP_PORT", "554"))
-HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
-HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8000"))
-RTSP_PATH = os.environ.get("RTSP_PATH", "/stream")  # Path to camera stream
+# Environment variable configuration
+ROBOT_IP = os.environ.get('ROBOT_IP', '127.0.0.1')
+ROS_API_PORT = int(os.environ.get('ROS_API_PORT', '9090'))
+RTSP_URL = os.environ.get('RTSP_URL', f'rtsp://{ROBOT_IP}:8554/live')  # Example RTSP
+HTTP_SERVER_HOST = os.environ.get('HTTP_SERVER_HOST', '0.0.0.0')
+HTTP_SERVER_PORT = int(os.environ.get('HTTP_SERVER_PORT', '8000'))
 
-# ROS/UDP/mock config (should be replaced with real robot interface)
-# For demonstration, this will simulate robot state & actions.
+# Simulated ROS API endpoints (for /status and /move)
+ROS_STATUS_URL = f'http://{ROBOT_IP}:{ROS_API_PORT}/status'
+ROS_MOVE_URL = f'http://{ROBOT_IP}:{ROS_API_PORT}/move'
+ROS_TASK_URL = f'http://{ROBOT_IP}:{ROS_API_PORT}/task'
 
-app = FastAPI()
+routes = aiohttp.web.RouteTableDef()
 
-robot_state = {
-    "localization": {"x": 1.1, "y": 2.2, "theta": 0.3},
-    "navigation": {"active": False, "goal": None},
-    "imu": {"roll": 0.01, "pitch": 0.02, "yaw": 0.03},
-    "velocity": {"x": 0.0, "y": 0.0, "z": 0.0}
-}
-task_status = {"SLAM": "stopped", "LiDAR": "stopped", "Navigation": "stopped"}
+@routes.post('/move')
+async def move(request):
+    # Forward the movement command to the robot's ROS API
+    try:
+        data = await request.json()
+    except Exception:
+        return aiohttp.web.json_response({'error': 'Invalid JSON'}, status=400)
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(ROS_MOVE_URL, json=data) as resp:
+                result = await resp.json()
+                return aiohttp.web.json_response(result, status=resp.status)
+        except Exception as e:
+            return aiohttp.web.json_response({'error': str(e)}, status=500)
 
-@app.post("/task")
-async def manage_task(request: Request):
-    """
-    Manage operational scripts such as SLAM, LiDAR, or navigation.
-    Body: {"action": "start"/"stop", "script": "SLAM"/"LiDAR"/"Navigation"}
-    """
-    data = await request.json()
-    action = data.get("action")
-    script = data.get("script")
-    if script not in task_status or action not in ("start", "stop"):
-        raise HTTPException(status_code=400, detail="Invalid script or action")
-    task_status[script] = "running" if action == "start" else "stopped"
-    return JSONResponse({"status": "ok", "script": script, "state": task_status[script]})
+@routes.get('/status')
+async def status(request):
+    # Fetch current status from the robot's ROS API
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(ROS_STATUS_URL) as resp:
+                result = await resp.json()
+                return aiohttp.web.json_response(result, status=resp.status)
+        except Exception as e:
+            return aiohttp.web.json_response({'error': str(e)}, status=500)
 
-@app.get("/status")
-async def get_status():
-    """
-    Fetch current status data including localization and navigation metrics.
-    """
-    # Replace with actual ROS/UDP fetch in real driver
-    return JSONResponse({
-        "localization": robot_state["localization"],
-        "navigation": robot_state["navigation"],
-        "imu": robot_state["imu"],
-        "velocity": robot_state["velocity"],
-        "tasks": task_status
-    })
+@routes.post('/task')
+async def task(request):
+    # Manage operational scripts (SLAM, LiDAR, navigation)
+    try:
+        data = await request.json()
+    except Exception:
+        return aiohttp.web.json_response({'error': 'Invalid JSON'}, status=400)
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(ROS_TASK_URL, json=data) as resp:
+                result = await resp.json()
+                return aiohttp.web.json_response(result, status=resp.status)
+        except Exception as e:
+            return aiohttp.web.json_response({'error': str(e)}, status=500)
 
-@app.post("/move")
-async def move_robot(request: Request):
-    """
-    Send movement commands to the robot.
-    Body: {"cmd_vel": {"x": float, "y": float, "z": float}}
-    """
-    data = await request.json()
-    cmd_vel = data.get("cmd_vel")
-    if not isinstance(cmd_vel, dict):
-        raise HTTPException(status_code=400, detail="Missing cmd_vel")
-    robot_state["velocity"] = cmd_vel
-    # Send to ROS topic or UDP here in real driver
-    return JSONResponse({"status": "ok", "cmd_vel": cmd_vel})
-
-# RTSP-to-HTTP proxy endpoint
-@app.get("/video")
-async def video():
-    """
-    Proxy the robot's RTSP video stream as HTTP MJPEG for browser/command-line access.
-    """
-    rtsp_url = f"rtsp://{DEVICE_IP}:{DEVICE_RTSP_PORT}{RTSP_PATH}"
-    return StreamingResponse(
-        rtsp_to_mjpeg(rtsp_url),
-        media_type="multipart/x-mixed-replace; boundary=frame"
+@routes.get('/video')
+async def video(request):
+    # HTTP MJPEG stream from RTSP video
+    response = aiohttp.web.StreamResponse(
+        status=200,
+        reason='OK',
+        headers={
+            'Content-Type': 'multipart/x-mixed-replace; boundary=frame'
+        }
     )
-
-async def rtsp_to_mjpeg(rtsp_url):
-    """
-    Connects to RTSP, decodes frames, encodes as JPEG, yields multipart MJPEG.
-    This implementation uses aiortc for RTSP and OpenCV for decoding/encoding.
-    """
-    import cv2
-    import numpy as np
-
-    # aiortc is not used here due to third-party command execution restriction.
-    # Instead, using OpenCV VideoCapture which links directly to the device.
-    cap = cv2.VideoCapture(rtsp_url)
+    await response.prepare(request)
+    # OpenCV VideoCapture for RTSP (no external commands)
+    cap = cv2.VideoCapture(RTSP_URL)
     if not cap.isOpened():
-        yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
-        await asyncio.sleep(0.1)
-        return
-
+        await response.write(b'--frame\r\nContent-Type: image/jpeg\r\n\r\n')
+        await response.write(b'')  # Empty JPEG
+        await response.write(b'\r\n')
+        await response.write_eof()
+        return response
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
-                await asyncio.sleep(0.1)
+                break
+            ret, jpeg = cv2.imencode('.jpg', frame)
+            if not ret:
                 continue
-            _, jpeg = cv2.imencode('.jpg', frame)
-            frame_bytes = jpeg.tobytes()
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n"
-                + frame_bytes +
-                b"\r\n"
+            jpg_bytes = jpeg.tobytes()
+            await response.write(
+                b'--frame\r\n'
+                b'Content-Type: image/jpeg\r\n\r\n' + jpg_bytes + b'\r\n'
             )
             await asyncio.sleep(0.04)  # ~25fps
     finally:
         cap.release()
+    await response.write_eof()
+    return response
 
-if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host=HTTP_SERVER_HOST,
-        port=HTTP_SERVER_PORT,
-        reload=False,
-        access_log=True
-    )
+app = aiohttp.web.Application()
+app.add_routes(routes)
+
+if __name__ == '__main__':
+    aiohttp.web.run_app(app, host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT)
