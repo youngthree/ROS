@@ -1,103 +1,219 @@
 import os
-import asyncio
+import io
 import json
-from fastapi import FastAPI, Request, Response, status
-from fastapi.responses import StreamingResponse, JSONResponse
-import uvicorn
-import aiohttp
+import threading
+import time
+from typing import Optional
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
+
+import socket
+import struct
+
 import cv2
 import numpy as np
 
-# Configuration from environment variables
-DEVICE_IP = os.environ.get('DEVICE_IP', '127.0.0.1')
-SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', 8080))
-RTSP_PORT = int(os.environ.get('RTSP_PORT', 554))
-RTSP_PATH = os.environ.get('RTSP_PATH', '/live')  # e.g., /live or /stream
-RTSP_USER = os.environ.get('RTSP_USER', '')
-RTSP_PASS = os.environ.get('RTSP_PASS', '')
+# -- Environment Variables --
+ROBOT_IP = os.environ.get("ROBOT_IP", "127.0.0.1")
+ROBOT_ROS_UDP_PORT = int(os.environ.get("ROBOT_ROS_UDP_PORT", "7070"))
+ROBOT_RTSP_URL = os.environ.get("ROBOT_RTSP_URL", f"rtsp://{ROBOT_IP}/live")
+HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
+HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
 
-# ROS/Status/Command endpoints (should be replaced with the actual robot's API endpoints)
-ROBOT_API_BASE = os.environ.get('ROBOT_API_BASE', f'http://{DEVICE_IP}:8808')
+# -- In-memory State --
+STATUS_CACHE = {
+    "localization": {},
+    "navigation": {},
+    "imu": {},
+    "odometry": {},
+    "ultrasound": {},
+    "yolo": {},
+    "last_update": 0
+}
+VELOCITY_QUEUE = []
+SCRIPT_STATUS = {
+    "SLAM": "stopped",
+    "LiDAR": "stopped",
+    "Navigation": "stopped"
+}
 
-app = FastAPI()
-
-
-@app.post("/task")
-async def manage_task(request: Request):
-    try:
-        payload = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=status.HTTP_400_BAD_REQUEST)
-    # Proxy the request to the robot's REST API (or mock if unavailable)
-    async with aiohttp.ClientSession() as session:
+# -- UDP Sensor Data Listener (Mock/Example for Status) --
+def udp_sensor_listener():
+    """
+    Listen to UDP port for incoming sensor data and update STATUS_CACHE.
+    This is a mockup; actual message decoding will depend on the robot's protocol.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((ROBOT_IP, ROBOT_ROS_UDP_PORT))
+    while True:
         try:
-            async with session.post(f"{ROBOT_API_BASE}/task", json=payload) as resp:
-                data = await resp.text()
-                return Response(content=data, status_code=resp.status, media_type=resp.headers.get("content-type", "application/json"))
-        except Exception as e:
-            return JSONResponse({"error": str(e)}, status_code=500)
+            data, _ = sock.recvfrom(65536)
+            # Mock: suppose JSON messages
+            try:
+                msg = json.loads(data.decode("utf-8"))
+                for k in msg:
+                    STATUS_CACHE[k] = msg[k]
+                STATUS_CACHE["last_update"] = time.time()
+            except Exception:
+                pass
+        except Exception:
+            continue
 
+udp_thread = threading.Thread(target=udp_sensor_listener, daemon=True)
+udp_thread.start()
 
-@app.get("/status")
-async def get_status():
-    # Proxy the status request
-    async with aiohttp.ClientSession() as session:
+# -- RTSP to HTTP JPEG Stream Proxy --
+class RTSPProxy(threading.Thread):
+    def __init__(self, rtsp_url):
+        super().__init__(daemon=True)
+        self.rtsp_url = rtsp_url
+        self.last_frame = None
+        self.running = threading.Event()
+        self.running.set()
+        self.capture = None
+
+    def run(self):
+        self.capture = cv2.VideoCapture(self.rtsp_url)
+        while self.running.is_set():
+            ret, frame = self.capture.read()
+            if ret:
+                ret2, jpeg = cv2.imencode('.jpg', frame)
+                if ret2:
+                    self.last_frame = jpeg.tobytes()
+            else:
+                # Try reconnecting if lost
+                self.capture.release()
+                time.sleep(1)
+                self.capture = cv2.VideoCapture(self.rtsp_url)
+            time.sleep(0.03)  # ~30fps
+
+    def get_frame(self) -> Optional[bytes]:
+        return self.last_frame
+
+    def stop(self):
+        self.running.clear()
+        if self.capture:
+            self.capture.release()
+
+rtsp_proxy = RTSPProxy(ROBOT_RTSP_URL)
+rtsp_proxy.start()
+
+# -- HTTP Server --
+class JueyingHTTPRequestHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/status":
+            self.handle_status()
+        elif parsed.path == "/video":
+            self.handle_video_stream()
+        else:
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error": "Not found"}')
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        content_length = int(self.headers.get('Content-Length', 0))
         try:
-            async with session.get(f"{ROBOT_API_BASE}/status") as resp:
-                data = await resp.text()
-                return Response(content=data, status_code=resp.status, media_type=resp.headers.get("content-type", "application/json"))
-        except Exception as e:
-            return JSONResponse({"error": str(e)}, status_code=500)
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode('utf-8'))
+        except Exception:
+            data = {}
+        if parsed.path == "/task":
+            self.handle_task(data)
+        elif parsed.path == "/move":
+            self.handle_move(data)
+        else:
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error": "Not found"}')
 
+    def handle_status(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        data = {
+            "localization": STATUS_CACHE.get("localization"),
+            "navigation": STATUS_CACHE.get("navigation"),
+            "imu": STATUS_CACHE.get("imu"),
+            "odometry": STATUS_CACHE.get("odometry"),
+            "ultrasound": STATUS_CACHE.get("ultrasound"),
+            "yolo": STATUS_CACHE.get("yolo"),
+            "script_status": SCRIPT_STATUS,
+            "last_update": STATUS_CACHE.get("last_update")
+        }
+        self.wfile.write(json.dumps(data).encode("utf-8"))
 
-@app.post("/move")
-async def move_robot(request: Request):
-    try:
-        payload = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=status.HTTP_400_BAD_REQUEST)
-    # Proxy the movement command
-    async with aiohttp.ClientSession() as session:
+    def handle_task(self, data):
+        # data: {"action": "start"/"stop", "script_type": "SLAM"/"LiDAR"/"Navigation"}
+        action = data.get("action")
+        script_type = data.get("script_type")
+        if action in ("start", "stop") and script_type in SCRIPT_STATUS:
+            SCRIPT_STATUS[script_type] = "running" if action == "start" else "stopped"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({"result": "ok", "status": SCRIPT_STATUS}).encode("utf-8"))
+        else:
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error": "Invalid action or script_type"}')
+
+    def handle_move(self, data):
+        # data: {"linear": [x, y, z], "angular": [x, y, z]}
+        VELOCITY_QUEUE.append((data, time.time()))
+        # In a real driver, this would send to robot via UDP/ROS topic
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps({"result": "ok"}).encode("utf-8"))
+
+    def handle_video_stream(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
         try:
-            async with session.post(f"{ROBOT_API_BASE}/move", json=payload) as resp:
-                data = await resp.text()
-                return Response(content=data, status_code=resp.status, media_type=resp.headers.get("content-type", "application/json"))
-        except Exception as e:
-            return JSONResponse({"error": str(e)}, status_code=500)
+            while True:
+                frame = rtsp_proxy.get_frame()
+                if not frame:
+                    time.sleep(0.05)
+                    continue
+                self.wfile.write(b"--frame\r\n")
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(frame)))
+                self.end_headers()
+                self.wfile.write(frame)
+                self.wfile.write(b"\r\n")
+                time.sleep(0.033)  # ~30fps
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
-
-def get_rtsp_url():
-    if RTSP_USER and RTSP_PASS:
-        return f"rtsp://{RTSP_USER}:{RTSP_PASS}@{DEVICE_IP}:{RTSP_PORT}{RTSP_PATH}"
-    return f"rtsp://{DEVICE_IP}:{RTSP_PORT}{RTSP_PATH}"
-
-
-async def mjpeg_stream():
-    loop = asyncio.get_event_loop()
-    rtsp_url = get_rtsp_url()
-    cap = cv2.VideoCapture(rtsp_url)
-    if not cap.isOpened():
-        raise RuntimeError("Unable to open RTSP stream")
+def run_server():
+    server = HTTPServer((HTTP_HOST, HTTP_PORT), JueyingHTTPRequestHandler)
+    print(f"HTTP server running at http://{HTTP_HOST}:{HTTP_PORT}")
     try:
-        while True:
-            ret, frame = await loop.run_in_executor(None, cap.read)
-            if not ret:
-                await asyncio.sleep(0.1)
-                continue
-            _, jpeg = cv2.imencode('.jpg', frame)
-            byte_frame = jpeg.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + byte_frame + b'\r\n')
-            await asyncio.sleep(0.04)  # ~25fps
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
     finally:
-        cap.release()
-
-
-@app.get("/video")
-async def video_feed():
-    return StreamingResponse(mjpeg_stream(), media_type='multipart/x-mixed-replace; boundary=frame')
-
+        server.server_close()
+        rtsp_proxy.stop()
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)
+    run_server()
