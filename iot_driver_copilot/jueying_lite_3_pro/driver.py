@@ -1,108 +1,120 @@
 import os
-import json
 import asyncio
+import json
+from aiohttp import web
 import aiohttp
-import aiohttp.web
-import websockets
 import cv2
 import numpy as np
 
-from aiohttp import web
+# ==== Environment Variables ====
+DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
+ROS_API_URL = os.environ.get("ROS_API_URL", f"http://{DEVICE_IP}:5000")
+RTSP_URL = os.environ.get("RTSP_URL", f"rtsp://{DEVICE_IP}/live")
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+VIDEO_STREAM_PATH = os.environ.get("VIDEO_STREAM_PATH", "/video")
+STATUS_PATH = os.environ.get("STATUS_PATH", "/status")
+MOVE_PATH = os.environ.get("MOVE_PATH", "/move")
+TASK_PATH = os.environ.get("TASK_PATH", "/task")
+# Only use RTSP port if needed, driver does not open any RTSP port, just connects out.
 
-# ================== Environment Variables ==================
-DEVICE_IP = os.environ.get('DEVICE_IP', '127.0.0.1')
-RTSP_PORT = int(os.environ.get('RTSP_PORT', '8554'))  # RTSP port of the camera/robot
-RTSP_PATH = os.environ.get('RTSP_PATH', 'stream')     # RTSP stream path
-HTTP_HOST = os.environ.get('HTTP_HOST', '0.0.0.0')
-HTTP_PORT = int(os.environ.get('HTTP_PORT', '8080'))
-ROS_STATUS_ENDPOINT = os.environ.get('ROS_STATUS_ENDPOINT', f'http://{DEVICE_IP}:5000/status')
-ROS_MOVE_ENDPOINT = os.environ.get('ROS_MOVE_ENDPOINT', f'http://{DEVICE_IP}:5000/move')
-ROS_TASK_ENDPOINT = os.environ.get('ROS_TASK_ENDPOINT', f'http://{DEVICE_IP}:5000/task')
+# ========== HTTP API ==========
+routes = web.RouteTableDef()
 
-# ================== RTSP to HTTP MJPEG Proxy ==================
-class RTSPToHTTPMJPEG:
-    def __init__(self, rtsp_url):
-        self.rtsp_url = rtsp_url
-        self.frame = None
-        self.clients = set()
-        self.running = False
-
-    async def start(self):
-        if not self.running:
-            self.running = True
-            loop = asyncio.get_event_loop()
-            loop.create_task(self._capture_frames())
-
-    async def _capture_frames(self):
-        cap = cv2.VideoCapture(self.rtsp_url)
+# ---- Video Streaming Endpoint (RTSP to HTTP) ----
+@routes.get(VIDEO_STREAM_PATH)
+async def video_stream(request):
+    async def stream_response(writer):
+        # OpenCV VideoCapture for RTSP stream
+        cap = cv2.VideoCapture(RTSP_URL)
         if not cap.isOpened():
-            print(f"Unable to open RTSP stream: {self.rtsp_url}")
-            self.running = False
+            await writer.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
+            await writer.write(b"Camera not available.\r\n")
             return
-        while self.running:
-            ret, frame = cap.read()
-            if not ret:
-                await asyncio.sleep(0.1)
-                continue
-            _, jpeg = cv2.imencode('.jpg', frame)
-            self.frame = jpeg.tobytes()
-            await asyncio.sleep(0.033)  # ~30 FPS
-        cap.release()
-
-    async def mjpeg_handler(self, request):
-        await self.start()
-        response = web.StreamResponse(
-            status=200,
-            reason='OK',
-            headers={
-                'Content-Type': 'multipart/x-mixed-replace; boundary=frame'
-            }
-        )
-        await response.prepare(request)
         try:
             while True:
-                if self.frame is not None:
-                    await response.write(b'--frame\r\n')
-                    await response.write(b'Content-Type: image/jpeg\r\n\r\n')
-                    await response.write(self.frame)
-                    await response.write(b'\r\n')
-                await asyncio.sleep(0.033)
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
-        return response
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                # Encode frame as JPEG
+                ret2, buffer = cv2.imencode('.jpg', frame)
+                if not ret2:
+                    continue
+                jpg_bytes = buffer.tobytes()
+                await writer.write(
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n" + jpg_bytes + b"\r\n"
+                )
+                await writer.drain()
+                await asyncio.sleep(0.04)  # ~25 FPS
+        finally:
+            cap.release()
+    headers = {
+        "Content-Type": "multipart/x-mixed-replace; boundary=frame"
+    }
+    return web.Response(body=stream_response, headers=headers)
 
-# ================== HTTP API Handlers ==================
-async def handle_status(request):
+# ---- Status Endpoint (GET) ----
+@routes.get(STATUS_PATH)
+async def get_status(request):
     async with aiohttp.ClientSession() as session:
-        async with session.get(ROS_STATUS_ENDPOINT) as resp:
-            data = await resp.read()
-            return web.Response(body=data, content_type='application/json')
+        try:
+            async with session.get(f"{ROS_API_URL}/status") as resp:
+                data = await resp.json()
+                return web.json_response(data)
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
 
-async def handle_move(request):
-    payload = await request.json()
+# ---- Move Endpoint (POST) ----
+@routes.post(MOVE_PATH)
+async def move_robot(request):
+    try:
+        payload = await request.json()
+    except:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
     async with aiohttp.ClientSession() as session:
-        async with session.post(ROS_MOVE_ENDPOINT, json=payload) as resp:
-            data = await resp.read()
-            return web.Response(body=data, content_type='application/json')
+        try:
+            async with session.post(f"{ROS_API_URL}/move", json=payload) as resp:
+                data = await resp.json()
+                return web.json_response(data)
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
 
-async def handle_task(request):
-    payload = await request.json()
+# ---- Task Endpoint (POST) ----
+@routes.post(TASK_PATH)
+async def manage_task(request):
+    try:
+        payload = await request.json()
+    except:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
     async with aiohttp.ClientSession() as session:
-        async with session.post(ROS_TASK_ENDPOINT, json=payload) as resp:
-            data = await resp.read()
-            return web.Response(body=data, content_type='application/json')
+        try:
+            async with session.post(f"{ROS_API_URL}/task", json=payload) as resp:
+                data = await resp.json()
+                return web.json_response(data)
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
 
-# ================== Main App Setup ==================
-rtsp_url = f"rtsp://{DEVICE_IP}:{RTSP_PORT}/{RTSP_PATH}"
-mjpeg_proxy = RTSPToHTTPMJPEG(rtsp_url)
+# ---- Root Endpoint ----
+@routes.get("/")
+async def index(request):
+    return web.Response(text=f"""
+    <html>
+    <head><title>Jueying Lite3 Pro Robot Driver</title></head>
+    <body>
+        <h2>Jueying Lite3 Pro HTTP Driver</h2>
+        <ul>
+            <li><a href="{VIDEO_STREAM_PATH}">Live Video Stream (in browser)</a></li>
+            <li><a href="{STATUS_PATH}">Status Endpoint (JSON)</a></li>
+            <li>Use POST {MOVE_PATH} and {TASK_PATH} (see API)</li>
+        </ul>
+    </body>
+    </html>
+    """, content_type='text/html')
 
+# ========== App Launch ==========
 app = web.Application()
-app.router.add_get('/video', mjpeg_proxy.mjpeg_handler)
-app.router.add_get('/status', handle_status)
-app.router.add_post('/move', handle_move)
-app.router.add_post('/task', handle_task)
+app.add_routes(routes)
 
-if __name__ == '__main__':
-    web.run_app(app, host=HTTP_HOST, port=HTTP_PORT)
+if __name__ == "__main__":
+    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
