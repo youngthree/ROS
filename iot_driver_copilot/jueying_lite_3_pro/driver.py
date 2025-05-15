@@ -1,136 +1,139 @@
 import os
 import asyncio
 import json
+import base64
 import aiohttp
-import aiohttp.web
-import websockets
+from aiohttp import web
 import cv2
 import numpy as np
 
-# --- ENVIRONMENT VARIABLES ---
-DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
-ROS_API_HOST = os.environ.get("ROS_API_HOST", DEVICE_IP)
-ROS_API_PORT = int(os.environ.get("ROS_API_PORT", "9090"))
-RTSP_URL = os.environ.get("RTSP_URL", f"rtsp://{DEVICE_IP}/live")
-HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
-HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8000"))
+# Environment variables
+DEVICE_IP = os.getenv("DEVICE_IP", "127.0.0.1")
+ROS_API_URL = os.getenv("ROS_API_URL", f"http://{DEVICE_IP}:5000")  # Example ROS REST bridge
+RTSP_URL = os.getenv("RTSP_URL", f"rtsp://{DEVICE_IP}/live")
+SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.getenv("SERVER_PORT", "8080"))
+RTSP_HTTP_STREAM_PATH = os.getenv("RTSP_HTTP_STREAM_PATH", "/video")  # Endpoint to serve HTTP MJPEG
 
-# --- ROS HTTP API ENDPOINTS (assumed for demonstration) ---
-ROS_CMD_VEL_TOPIC = os.environ.get("ROS_CMD_VEL_TOPIC", "/cmd_vel")
-ROS_NAV_STATUS_TOPIC = os.environ.get("ROS_NAV_STATUS_TOPIC", "/navigation/status")
-ROS_LOCALIZATION_TOPIC = os.environ.get("ROS_LOCALIZATION_TOPIC", "/localization/status")
-ROS_SCRIPT_API_URL = os.environ.get("ROS_SCRIPT_API_URL", f"http://{ROS_API_HOST}:{ROS_API_PORT}/scripts")
+# --- ROS Bridge Functions (Assume REST bridge on device or accessible) ---
 
-# --- HTTP SERVER ---
-
-routes = aiohttp.web.RouteTableDef()
-
-# -- UTILS --
-
-async def fetch_navigation_status():
-    # Placeholder: Fetch navigation/localization/status from ROS API or UDP endpoint
-    # Here we simulate with dummy data for demonstration
-    status = {
-        "localization": {"x": 1.23, "y": 4.56, "theta": 0.78},
-        "navigation": {"active": True, "goal": [2.0, 3.0]},
-        "sensors": {
-            "imu": {"linear_acceleration": [0.01, 0.0, 9.8]},
-            "ultrasound_distance": [1.2, 2.5, 0.8]
-        }
-    }
-    return status
-
-async def ros_publish_cmd_vel(cmd):
+async def ros_post(endpoint, data):
+    url = f"{ROS_API_URL}{endpoint}"
     async with aiohttp.ClientSession() as session:
-        url = f"http://{ROS_API_HOST}:{ROS_API_PORT}/rosapi/publish"
-        payload = {
-            "topic": ROS_CMD_VEL_TOPIC,
-            "msg": cmd
-        }
-        async with session.post(url, json=payload) as resp:
-            return await resp.text()
+        async with session.post(url, json=data) as resp:
+            result = await resp.text()
+            try:
+                return json.loads(result)
+            except Exception:
+                return {"result": result}
 
-async def manage_script(action, script_type):
+async def ros_get(endpoint):
+    url = f"{ROS_API_URL}{endpoint}"
     async with aiohttp.ClientSession() as session:
-        url = f"{ROS_SCRIPT_API_URL}/{script_type}/{action}"
-        async with session.post(url) as resp:
-            return await resp.text()
+        async with session.get(url) as resp:
+            result = await resp.text()
+            try:
+                return json.loads(result)
+            except Exception:
+                return {"result": result}
 
-# --- API ENDPOINTS ---
+# --- HTTP API Handlers ---
 
-@routes.post('/move')
-async def move(request):
+async def handle_task(request):
     try:
         data = await request.json()
-        # Forward cmd_vel to ROS (assume JSON matches ROS message for geometry_msgs/Twist)
-        result = await ros_publish_cmd_vel(data)
-        return aiohttp.web.json_response({"result": result})
+        action = data.get("action")
+        script_type = data.get("script_type")
+        if not action or not script_type:
+            return web.json_response({"error": "Missing action or script_type"}, status=400)
+        # Call ROS REST API to start/stop scripts (e.g., /scripts)
+        ros_resp = await ros_post("/scripts", {"action": action, "type": script_type})
+        return web.json_response(ros_resp)
     except Exception as e:
-        return aiohttp.web.json_response({"error": str(e)}, status=400)
+        return web.json_response({"error": str(e)}, status=500)
 
-@routes.get('/status')
-async def status(request):
-    # Fetch status data from ROS/UDP/etc.
-    status = await fetch_navigation_status()
-    return aiohttp.web.json_response(status)
+async def handle_status(request):
+    try:
+        ros_resp = await ros_get("/status")
+        return web.json_response(ros_resp)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 
-@routes.post('/task')
-async def task(request):
+async def handle_move(request):
     try:
         data = await request.json()
-        action = data.get("action", "start")
-        script_type = data.get("script_type", "slam")
-        result = await manage_script(action, script_type)
-        return aiohttp.web.json_response({"result": result})
+        # Forward movement command to ROS
+        ros_resp = await ros_post("/move", data)
+        return web.json_response(ros_resp)
     except Exception as e:
-        return aiohttp.web.json_response({"error": str(e)}, status=400)
+        return web.json_response({"error": str(e)}, status=500)
 
-# --- MJPEG VIDEO STREAM (RTSP -> HTTP) ---
+# --- RTSP to HTTP MJPEG Proxy ---
 
-async def mjpeg_video_stream(request):
-    # Use OpenCV to connect to RTSP and yield as HTTP multipart
-    boundary = "frame"
-    response = aiohttp.web.StreamResponse(
-        status=200,
-        reason='OK',
-        headers={
-            'Content-Type': f'multipart/x-mixed-replace; boundary={boundary}',
-            'Cache-Control': 'no-cache',
-            'Connection': 'close',
-            'Pragma': 'no-cache',
-        }
-    )
-    await response.prepare(request)
-    cap = cv2.VideoCapture(RTSP_URL)
-    try:
+class RTSPtoHTTPStream:
+    def __init__(self, rtsp_url):
+        self.rtsp_url = rtsp_url
+        self.cap = None
+        self.running = False
+
+    def open(self):
+        if not self.cap:
+            self.cap = cv2.VideoCapture(self.rtsp_url)
+            if not self.cap.isOpened():
+                self.cap.release()
+                self.cap = None
+
+    def close(self):
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+
+    def get_frame(self):
+        if not self.cap:
+            self.open()
+        if self.cap:
+            ret, frame = self.cap.read()
+            if ret:
+                ret, jpeg = cv2.imencode('.jpg', frame)
+                if ret:
+                    return jpeg.tobytes()
+        return None
+
+    async def mjpeg_generator(self):
+        self.open()
         while True:
-            ret, frame = cap.read()
-            if not ret:
+            frame = self.get_frame()
+            if frame is None:
                 await asyncio.sleep(0.1)
                 continue
-            ret, jpeg = cv2.imencode('.jpg', frame)
-            if not ret:
-                continue
-            await response.write(
-                b"--" + boundary.encode() + b"\r\n"
-                + b"Content-Type: image/jpeg\r\n"
-                + f"Content-Length: {len(jpeg)}\r\n\r\n".encode()
-                + jpeg.tobytes() + b"\r\n"
-            )
-            await asyncio.sleep(0.033)  # ~30fps
-    except asyncio.CancelledError:
-        pass
-    finally:
-        cap.release()
-        await response.write_eof()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+            await asyncio.sleep(0.04)  # ~25fps
+
+rtsp_streamer = RTSPtoHTTPStream(RTSP_URL)
+
+async def handle_video(request):
+    response = web.StreamResponse(
+        status=200,
+        reason='OK',
+        headers={'Content-Type': 'multipart/x-mixed-replace; boundary=frame'}
+    )
+    await response.prepare(request)
+    async for frame in rtsp_streamer.mjpeg_generator():
+        await response.write(frame)
     return response
 
-routes.get('/video')(mjpeg_video_stream)
+# --- App Factory ---
 
-# --- MAIN ---
+def make_app():
+    app = web.Application()
+    app.router.add_post('/task', handle_task)
+    app.router.add_get('/status', handle_status)
+    app.router.add_post('/move', handle_move)
+    app.router.add_get(RTSP_HTTP_STREAM_PATH, handle_video)
+    return app
 
-app = aiohttp.web.Application()
-app.add_routes(routes)
+# --- Main Entrypoint ---
 
-if __name__ == "__main__":
-    aiohttp.web.run_app(app, host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT)
+if __name__ == '__main__':
+    web.run_app(make_app(), host=SERVER_HOST, port=SERVER_PORT)
