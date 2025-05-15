@@ -2,96 +2,190 @@ import os
 import io
 import json
 import asyncio
-from fastapi import FastAPI, Request, Response, status
-from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
-from pydantic import BaseModel
+import threading
 from typing import Optional
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+
 import cv2
 import numpy as np
-import uvicorn
 
-# ENVIRONMENT VARIABLES
-DEVICE_IP = os.getenv("DEVICE_IP", "127.0.0.1")
-RTSP_PORT = int(os.getenv("RTSP_PORT", 554))
-RTSP_PATH = os.getenv("RTSP_PATH", "/live")
-SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.getenv("SERVER_PORT", 8000))
+import rospy
+from geometry_msgs.msg import Twist
+from std_msgs.msg import String
 
-# Simulated ROS/UDP endpoints (replace with real integration as needed)
-def get_robot_status():
-    # Placeholder: Replace with actual ROS/UDP query logic
-    return {
-        "localization": {"x": 1.23, "y": 4.56, "theta": 0.78},
-        "navigation_status": "active",
-        "imu": {"yaw": 0.1, "pitch": 0.02, "roll": -0.01},
-        "joint_states": [0.1, 0.2, 0.3],
-        "leg_odom": {"left": 0.5, "right": 0.5}
-    }
+# --- Environment Variables ---
+DEVICE_IP = os.environ.get('DEVICE_IP')
+ROS_MASTER_URI = os.environ.get('ROS_MASTER_URI')  # e.g. 'http://192.168.1.10:11311'
+SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
+SERVER_PORT = int(os.environ.get('SERVER_PORT', '8000'))
+RTSP_URL = os.environ.get('RTSP_URL')  # e.g. 'rtsp://192.168.1.10/stream'
+ROS_NAMESPACE = os.environ.get('ROS_NAMESPACE', '')
+ROS_CMD_VEL_TOPIC = os.environ.get('ROS_CMD_VEL_TOPIC', 'cmd_vel')
+ROS_STATUS_TOPIC = os.environ.get('ROS_STATUS_TOPIC', 'robot_status')
 
-def send_move_command(cmd):
-    # Placeholder: Implement ROS topic publishing or UDP packet sending here
-    return {"result": "success", "sent": cmd}
+# --- ROS Setup (run in another thread to avoid blocking HTTP server) ---
+rospy_inited = False
 
-def manage_task(action, script_type):
-    # Placeholder: Start/stop scripts (e.g., SLAM, LiDAR, Navigation)
-    return {"result": "success", "action": action, "script_type": script_type}
+def ros_init():
+    global rospy_inited
+    if not rospy_inited:
+        rospy.init_node('jueying_lite3pro_driver', anonymous=True, disable_signals=True)
+        rospy_inited = True
 
-# MODELS
-class MoveCommand(BaseModel):
-    linear_x: float
-    linear_y: Optional[float] = 0.0
-    linear_z: Optional[float] = 0.0
-    angular_x: Optional[float] = 0.0
-    angular_y: Optional[float] = 0.0
-    angular_z: float
+def ros_publish_cmd_vel(data):
+    ros_init()
+    pub = rospy.Publisher(ROS_CMD_VEL_TOPIC, Twist, queue_size=1)
+    twist = Twist()
+    twist.linear.x = data.get('linear', {}).get('x', 0)
+    twist.linear.y = data.get('linear', {}).get('y', 0)
+    twist.linear.z = data.get('linear', {}).get('z', 0)
+    twist.angular.x = data.get('angular', {}).get('x', 0)
+    twist.angular.y = data.get('angular', {}).get('y', 0)
+    twist.angular.z = data.get('angular', {}).get('z', 0)
+    pub.publish(twist)
 
-class TaskCommand(BaseModel):
-    action: str
-    script_type: str
+# --- ROS Status Subscription ---
+latest_status = {}
 
-app = FastAPI()
+def ros_status_callback(msg):
+    global latest_status
+    latest_status = json.loads(msg.data)
 
-@app.get("/status")
-async def status():
-    status = get_robot_status()
-    return JSONResponse(content=status)
+def ros_subscribe_status():
+    ros_init()
+    rospy.Subscriber(ROS_STATUS_TOPIC, String, ros_status_callback)
 
-@app.post("/move")
-async def move(command: MoveCommand):
-    result = send_move_command(command.dict())
-    return JSONResponse(content=result)
+status_thread = threading.Thread(target=ros_subscribe_status, daemon=True)
+status_thread.start()
 
-@app.post("/task")
-async def task(command: TaskCommand):
-    result = manage_task(command.action, command.script_type)
-    return JSONResponse(content=result)
+# --- ROS Script Control (simulate with a publisher) ---
+def ros_manage_task(action, script_type):
+    ros_init()
+    pub = rospy.Publisher('script_control', String, queue_size=1)
+    payload = {'action': action, 'script_type': script_type}
+    pub.publish(json.dumps(payload))
 
-def mjpeg_frame_generator(rtsp_url):
-    cap = cv2.VideoCapture(rtsp_url)
-    if not cap.isOpened():
-        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' +
-               cv2.imencode('.jpg', np.zeros((240,320,3), dtype=np.uint8))[1].tobytes() + b'\r\n')
-        return
+# --- RTSP to HTTP JPEG MJPEG Streamer ---
+class RTSPStreamer(threading.Thread):
+    def __init__(self, rtsp_url):
+        super().__init__()
+        self.rtsp_url = rtsp_url
+        self.cap = None
+        self.latest_frame = None
+        self.running = True
+        self.lock = threading.Lock()
+        self.daemon = True
+
+    def run(self):
+        self.cap = cv2.VideoCapture(self.rtsp_url)
+        while self.running and self.cap.isOpened():
+            ret, frame = self.cap.read()
+            if ret:
+                with self.lock:
+                    self.latest_frame = frame
+            else:
+                break
+        if self.cap:
+            self.cap.release()
+
+    def get_jpeg(self):
+        with self.lock:
+            if self.latest_frame is not None:
+                ret, jpeg = cv2.imencode('.jpg', self.latest_frame)
+                if ret:
+                    return jpeg.tobytes()
+            return None
+
+    def stop(self):
+        self.running = False
+
+rtsp_streamer = None
+if RTSP_URL:
+    rtsp_streamer = RTSPStreamer(RTSP_URL)
+    rtsp_streamer.start()
+
+# --- HTTP Server ---
+class RequestHandler(BaseHTTPRequestHandler):
+    def _set_headers(self, status=200, mime='application/json'):
+        self.send_response(status)
+        self.send_header('Content-type', mime)
+        self.end_headers()
+
+    def do_GET(self):
+        if self.path == '/status':
+            self._set_headers()
+            self.wfile.write(json.dumps(latest_status).encode())
+        elif self.path == '/video':
+            if not rtsp_streamer:
+                self._set_headers(404)
+                self.wfile.write(b'{"error":"RTSP streaming not configured"}')
+                return
+            self.send_response(200)
+            self.send_header('Content-type', 'multipart/x-mixed-replace; boundary=frame')
+            self.end_headers()
+            try:
+                while True:
+                    frame = rtsp_streamer.get_jpeg()
+                    if frame is not None:
+                        self.wfile.write(b'--frame\r\n')
+                        self.wfile.write(b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+                    else:
+                        self.wfile.write(b'--frame\r\n\r\n')
+                    self.wfile.flush()
+                    # 20 fps
+                    threading.Event().wait(0.05)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        else:
+            self._set_headers(404)
+            self.wfile.write(b'{"error":"Not Found"}')
+
+    def do_POST(self):
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length) if content_length > 0 else b''
+        response = {}
+        if self.path == '/move':
+            try:
+                data = json.loads(body.decode())
+                ros_publish_cmd_vel(data)
+                self._set_headers()
+                response = {"status": "sent", "data": data}
+            except Exception as e:
+                self._set_headers(400)
+                response = {"error": str(e)}
+        elif self.path == '/task':
+            try:
+                data = json.loads(body.decode())
+                action = data.get('action')
+                script_type = data.get('script_type')
+                if not action or not script_type:
+                    raise ValueError('Missing action or script_type')
+                ros_manage_task(action, script_type)
+                self._set_headers()
+                response = {"status": "task action sent", "action": action, "script_type": script_type}
+            except Exception as e:
+                self._set_headers(400)
+                response = {"error": str(e)}
+        else:
+            self._set_headers(404)
+            response = {"error": "Not Found"}
+        self.wfile.write(json.dumps(response).encode())
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    pass
+
+def run_server():
+    server_address = (SERVER_HOST, SERVER_PORT)
+    httpd = ThreadedHTTPServer(server_address, RequestHandler)
+    print(f'Serving HTTP on {SERVER_HOST}:{SERVER_PORT}...')
     try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                continue
-            ret, buffer = cv2.imencode('.jpg', frame)
-            if not ret:
-                continue
-            jpg_bytes = buffer.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' +
-                   jpg_bytes + b'\r\n')
-    finally:
-        cap.release()
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    if rtsp_streamer:
+        rtsp_streamer.stop()
+    httpd.server_close()
 
-@app.get("/video")
-async def video_stream():
-    rtsp_url = f"rtsp://{DEVICE_IP}:{RTSP_PORT}{RTSP_PATH}"
-    return StreamingResponse(mjpeg_frame_generator(rtsp_url),
-                             media_type="multipart/x-mixed-replace; boundary=frame")
-
-if __name__ == "__main__":
-    uvicorn.run("main:app", host=SERVER_HOST, port=SERVER_PORT)
+if __name__ == '__main__':
+    run_server()
