@@ -1,126 +1,172 @@
 import os
-import io
-import threading
-import time
+import asyncio
 import json
-import requests
-from flask import Flask, request, Response, stream_with_context, jsonify
+from aiohttp import web
+import aiohttp
 import cv2
 import numpy as np
 
-app = Flask(__name__)
-
-# --- Environment Variables ---
+# Environment Variables
 DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
-ROS_API_HOST = os.environ.get("ROS_API_HOST", DEVICE_IP)  # optional, fallback to device IP
-ROS_API_PORT = int(os.environ.get("ROS_API_PORT", "50051"))
-RTSP_URL = os.environ.get("RTSP_URL", f"rtsp://{DEVICE_IP}/video")
-HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
-HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8080"))
+DEVICE_ROSBRIDGE_PORT = int(os.environ.get("DEVICE_ROSBRIDGE_PORT", "9090"))
+DEVICE_RTSP_PORT = int(os.environ.get("DEVICE_RTSP_PORT", "554"))
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+RTSP_PATH = os.environ.get("RTSP_PATH", "/stream")  # Path after rtsp://IP:PORT
 
-# For demo, we simulate ROS/UDP/other connections by placeholder implementations.
-# In real-world, use rospy, roslibpy, socket, etc.
+# For ROSBridge websocket communication
+ROSBRIDGE_URI = f"ws://{DEVICE_IP}:{DEVICE_ROSBRIDGE_PORT}"
 
+# For RTSP video streaming
+RTSP_URL = f"rtsp://{DEVICE_IP}:{DEVICE_RTSP_PORT}{RTSP_PATH}"
 
-# --- Mocked/Placeholder ROS/UDP Data Access Functions ---
+# --- /status helper: Fetch localization/navigation state from ROSBridge ---
+async def fetch_status():
+    # Using aiohttp websocket to ROSBridge
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(ROSBRIDGE_URI) as ws:
+            # Subscribe to relevant status topics (e.g., /odom, /imu, /navigation_status)
+            subscribe_msgs = [
+                {
+                    "op": "subscribe",
+                    "topic": "/odom",
+                    "type": "nav_msgs/Odometry",
+                    "id": "odom_sub"
+                },
+                {
+                    "op": "subscribe",
+                    "topic": "/imu",
+                    "type": "sensor_msgs/Imu",
+                    "id": "imu_sub"
+                },
+                {
+                    "op": "subscribe",
+                    "topic": "/navigation_status",
+                    "id": "nav_status_sub"
+                }
+            ]
+            for msg in subscribe_msgs:
+                await ws.send_json(msg)
+            status = {}
+            required = {"odom": False, "imu": False, "navigation_status": False}
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    if data.get("topic") == "/odom" and not required["odom"]:
+                        status["odom"] = data.get("msg", {})
+                        required["odom"] = True
+                    elif data.get("topic") == "/imu" and not required["imu"]:
+                        status["imu"] = data.get("msg", {})
+                        required["imu"] = True
+                    elif data.get("topic") == "/navigation_status" and not required["navigation_status"]:
+                        status["navigation_status"] = data.get("msg", {})
+                        required["navigation_status"] = True
+                    if all(required.values()):
+                        break
+            # Unsubscribe
+            for msg in subscribe_msgs:
+                unsub = msg.copy()
+                unsub["op"] = "unsubscribe"
+                await ws.send_json(unsub)
+            return status
 
-def get_robot_status():
-    # Simulate fetching status from robot (e.g., via ROS service call/UDP/REST)
-    # In production, replace with actual ROS/UDP/REST logic
-    # Example format for demonstration
-    status = {
-        "localization": {"x": 1.2, "y": 3.4, "theta": 0.56},
-        "navigation": {"state": "navigating", "goal": [4.5, 6.7]},
-        "imu": {"accel": [0.1, 0.2, 9.8], "gyro": [0.01, 0.02, 0.03]},
-        "battery": {"voltage": 24.2, "current": 0.5, "percentage": 90}
-    }
-    return status
+# --- /move helper: Publish movement command to ROSBridge ---
+async def publish_move(cmd):
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(ROSBRIDGE_URI) as ws:
+            msg = {
+                "op": "publish",
+                "topic": "/cmd_vel",
+                "msg": cmd,
+                "type": "geometry_msgs/Twist"
+            }
+            await ws.send_json(msg)
+            # Optionally wait for ACK or just short delay
+            await asyncio.sleep(0.1)
+            return {"result": "success"}
 
-def send_movement_command(cmd_json):
-    # Simulate sending velocity command to robot (via ROS/UDP)
-    # In production, replace with actual ROS/UDP publishing logic
-    # cmd_json example: {"linear":{"x":0.5,"y":0.0,"z":0.0},"angular":{"x":0.0,"y":0.0,"z":0.1}}
-    return {"result": "success", "echo": cmd_json}
+# --- /task helper: Start/stop scripts via ROSBridge service call ---
+async def manage_task(action, script_type):
+    # This assumes existence of a ROSBridge service for script management
+    service_name = f"/{script_type}_{action}"
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(ROSBRIDGE_URI) as ws:
+            srv_msg = {
+                "op": "call_service",
+                "service": service_name,
+                "args": {},
+                "id": f"task_{action}_{script_type}"
+            }
+            await ws.send_json(srv_msg)
+            async for msg in ws:
+                resp = json.loads(msg.data)
+                if resp.get("id") == srv_msg["id"]:
+                    return resp.get("values", {"result": "unknown"})
+    return {"result": "failed"}
 
-def manage_task(action, script_type):
-    # Simulate starting/stopping operational scripts (SLAM/LIDAR/navigation)
-    # In production, call relevant script control interfaces
-    if action not in {"start", "stop"}:
-        return {"result": "error", "message": "Invalid action"}
-    if script_type not in {"slam", "lidar", "navigation"}:
-        return {"result": "error", "message": "Invalid script_type"}
-    return {"result": "success", "action": action, "script_type": script_type}
-
-# --- RTSP to HTTP(MJPEG) Proxying ---
-
-def generate_mjpeg(rtsp_url):
-    # OpenCV VideoCapture for RTSP
-    cap = cv2.VideoCapture(rtsp_url)
+# --- RTSP to HTTP MJPEG Streaming Proxy ---
+async def mjpeg_stream(request):
+    # OpenCV VideoCapture on RTSP stream
+    cap = cv2.VideoCapture(RTSP_URL)
     if not cap.isOpened():
-        yield b''
-        return
-    try:
-        while True:
+        return web.Response(status=503, text="Unable to connect to RTSP stream")
+    async def stream_response(resp):
+        while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
-                time.sleep(0.1)
-                continue
-            # Encode frame as JPEG
+                break
             ret, jpeg = cv2.imencode('.jpg', frame)
             if not ret:
-                continue
-            frame_bytes = jpeg.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-    finally:
+                break
+            await resp.write(b"--frame\r\n")
+            await resp.write(b"Content-Type: image/jpeg\r\n\r\n")
+            await resp.write(jpeg.tobytes())
+            await resp.write(b"\r\n")
+            await asyncio.sleep(0.04)  # ~25FPS
         cap.release()
+    headers = {
+        'Content-Type': 'multipart/x-mixed-replace; boundary=frame'
+    }
+    resp = web.StreamResponse(status=200, reason='OK', headers=headers)
+    await resp.prepare(request)
+    await stream_response(resp)
+    return resp
 
-@app.route('/video')
-def video_feed():
-    """MJPEG stream from RTSP source, HTTP-consumable."""
-    return Response(stream_with_context(generate_mjpeg(RTSP_URL)),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+# --- API Handlers ---
 
-# --- API Endpoints ---
+async def status_handler(request):
+    status = await fetch_status()
+    return web.json_response(status)
 
-@app.route('/status', methods=['GET'])
-def status():
-    status = get_robot_status()
-    return jsonify(status)
-
-@app.route('/move', methods=['POST'])
-def move():
+async def move_handler(request):
     try:
-        cmd = request.get_json(force=True)
+        payload = await request.json()
+        cmd = payload.get("cmd_vel") or payload.get("cmd_vel_corrected") or payload
+        # Expect geometry_msgs/Twist format
+        result = await publish_move(cmd)
+        return web.json_response(result)
     except Exception as e:
-        return jsonify({"result": "error", "message": "Invalid JSON", "error": str(e)}), 400
-    result = send_movement_command(cmd)
-    return jsonify(result)
+        return web.json_response({"error": str(e)}, status=400)
 
-@app.route('/task', methods=['POST'])
-def task():
+async def task_handler(request):
     try:
-        data = request.get_json(force=True)
-        action = data.get("action")
-        script_type = data.get("script_type")
-        if not action or not script_type:
-            return jsonify({"result": "error", "message": "Missing action or script_type"}), 400
+        payload = await request.json()
+        action = payload.get("action")  # "start" or "stop"
+        script_type = payload.get("script_type")  # e.g., "slam", "lidar", "navigation"
+        if action not in ("start", "stop") or not script_type:
+            raise Exception("Invalid action or script_type")
+        result = await manage_task(action, script_type)
+        return web.json_response(result)
     except Exception as e:
-        return jsonify({"result": "error", "message": "Invalid JSON", "error": str(e)}), 400
-    result = manage_task(action, script_type)
-    return jsonify(result)
+        return web.json_response({"error": str(e)}, status=400)
 
-@app.route('/')
-def index():
-    return '''
-    <h2>Jueying Lite3 Pro Driver</h2>
-    <ul>
-        <li>GET <a href="/video">/video</a> (live MJPEG stream)</li>
-        <li>GET /status</li>
-        <li>POST /move (JSON: {"linear": {...}, "angular": {...}})</li>
-        <li>POST /task (JSON: {"action": "start|stop", "script_type": "slam|lidar|navigation"})</li>
-    </ul>
-    '''
+# --- App Setup ---
 
-if __name__ == '__main__':
-    app.run(host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT, threaded=True)
+app = web.Application()
+app.router.add_route('GET', '/video', mjpeg_stream)
+app.router.add_route('GET', '/status', status_handler)
+app.router.add_route('POST', '/move', move_handler)
+app.router.add_route('POST', '/task', task_handler)
+
+if __name__ == "__main__":
+    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
