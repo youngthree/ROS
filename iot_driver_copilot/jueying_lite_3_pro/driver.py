@@ -1,121 +1,114 @@
 import os
-import asyncio
+import io
+import cv2
+import time
 import json
-from aiohttp import web, ClientSession
-import aiohttp
+import queue
 import base64
+import socket
+import struct
+import threading
+from flask import Flask, Response, request, jsonify, stream_with_context
 
-# Environment Variables
-DEVICE_IP = os.environ.get('DEVICE_IP', '127.0.0.1')
-RTSP_URL = os.environ.get('RTSP_URL', f'rtsp://{DEVICE_IP}:8554/live')
-ROS_API_URL = os.environ.get('ROS_API_URL', f'http://{DEVICE_IP}:8000')
-HTTP_SERVER_HOST = os.environ.get('HTTP_SERVER_HOST', '0.0.0.0')
-HTTP_SERVER_PORT = int(os.environ.get('HTTP_SERVER_PORT', '8080'))
-RTSP_PROXY_PORT = int(os.environ.get('RTSP_PROXY_PORT', '8554'))
+# --- Environment Variables ---
+DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
+RTSP_URL = os.environ.get("RTSP_URL", f"rtsp://{DEVICE_IP}:8554/live")
+ROS_UDP_PORT = int(os.environ.get("ROS_UDP_PORT", "5555"))
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
 
-# MJPEG boundary
-MJPEG_BOUNDARY = '--frame'
+# --- HTTP Server ---
+app = Flask(__name__)
 
-# Simple RTSP-to-MJPEG proxy (partial, naive implementation)
-async def rtsp_to_mjpeg(rtsp_url):
-    '''
-    This generator yields JPEG frames extracted from an RTSP stream as multipart/x-mixed-replace.
-    For simplicity, this stub expects the RTSP stream to provide JPEG frames via RTP,
-    which is the case for some robots/cameras. For more complex codecs, a transcoder would be required.
-    '''
-    import cv2
-    import numpy as np
-
+# -------- Video Stream (RTSP -> HTTP MJPEG) --------
+def generate_mjpeg(rtsp_url):
     cap = cv2.VideoCapture(rtsp_url)
     if not cap.isOpened():
-        raise RuntimeError("Cannot open RTSP stream")
-
+        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + b'' + b'\r\n')
+        return
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
-                await asyncio.sleep(0.1)
-                continue
-            ret, jpeg = cv2.imencode('.jpg', frame)
-            if not ret:
-                continue
-            jpg_bytes = jpeg.tobytes()
-            # yield in multipart/x-mixed-replace format
-            yield (
-                f"{MJPEG_BOUNDARY}\r\n"
-                "Content-Type: image/jpeg\r\n"
-                f"Content-Length: {len(jpg_bytes)}\r\n\r\n"
-            ).encode() + jpg_bytes + b"\r\n"
-            await asyncio.sleep(0.04)  # ~25 FPS
+                break
+            _, jpeg = cv2.imencode('.jpg', frame)
+            frame_bytes = jpeg.tobytes()
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
     finally:
         cap.release()
 
-async def mjpeg_stream(request):
-    response = web.StreamResponse(
-        status=200,
-        reason='OK',
-        headers={
-            'Content-Type': f'multipart/x-mixed-replace; boundary={MJPEG_BOUNDARY[2:]}',
-            'Cache-Control': 'no-cache, private',
-            'Pragma': 'no-cache'
-        }
+@app.route('/video')
+def video_feed():
+    return Response(
+        stream_with_context(generate_mjpeg(RTSP_URL)),
+        mimetype='multipart/x-mixed-replace; boundary=frame'
     )
-    await response.prepare(request)
+
+# -------- UDP/ROS Bridge for Status --------
+status_data = {}
+udp_thread_running = threading.Event()
+udp_thread_running.set()
+
+def udp_listener(status_data, port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(('', port))
+    sock.settimeout(1.0)
+    while udp_thread_running.is_set():
+        try:
+            data, _ = sock.recvfrom(65535)
+            try:
+                msg = json.loads(data.decode('utf-8'))
+                status_data.clear()
+                status_data.update(msg)
+            except Exception:
+                continue
+        except socket.timeout:
+            continue
+    sock.close()
+
+udp_thread = threading.Thread(target=udp_listener, args=(status_data, ROS_UDP_PORT), daemon=True)
+udp_thread.start()
+
+@app.route('/status', methods=['GET'])
+def get_status():
+    # Return a basic status summary
+    return jsonify({
+        "status": "ok",
+        "data": status_data
+    })
+
+# -------- POST /move: Send velocity commands (cmd_vel) --------
+def send_udp_command(payload, port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    data = json.dumps(payload).encode('utf-8')
+    sock.sendto(data, (DEVICE_IP, port))
+    sock.close()
+
+@app.route('/move', methods=['POST'])
+def move():
+    payload = request.get_json(force=True)
+    # Send as UDP for demonstration (normally via ROS topic)
+    send_udp_command({"cmd": "move", "payload": payload}, ROS_UDP_PORT)
+    return jsonify({"status": "sent", "payload": payload})
+
+# -------- POST /task: Manage operational scripts --------
+@app.route('/task', methods=['POST'])
+def task():
+    req = request.get_json(force=True)
+    action = req.get("action", "").lower()
+    script_type = req.get("script_type", "").lower()
+    # Simulation: send to UDP or update status (no shell exec)
+    send_udp_command({"cmd": "task", "action": action, "script_type": script_type}, ROS_UDP_PORT)
+    return jsonify({"status": "ack", "action": action, "script_type": script_type})
+
+# -------- Main --------
+def shutdown_server():
+    udp_thread_running.clear()
+    udp_thread.join()
+
+if __name__ == "__main__":
     try:
-        async for chunk in rtsp_to_mjpeg(RTSP_URL):
-            await response.write(chunk)
-    except Exception as e:
-        pass
+        app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
     finally:
-        await response.write_eof()
-    return response
-
-async def get_status(request):
-    async with ClientSession() as session:
-        # Example: fetch status from ROS API or device HTTP API
-        async with session.get(f"{ROS_API_URL}/status") as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return web.json_response(data)
-            else:
-                return web.json_response({'error': 'Failed to fetch status'}, status=500)
-
-async def post_task(request):
-    payload = await request.json()
-    action = payload.get('action')  # 'start' or 'stop'
-    script_type = payload.get('script_type')  # e.g., 'slam', 'lidar', 'navigation'
-    cmd = {
-        'action': action,
-        'script_type': script_type
-    }
-    async with ClientSession() as session:
-        async with session.post(f"{ROS_API_URL}/task", json=cmd) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return web.json_response(data)
-            else:
-                return web.json_response({'error': 'Failed to manage task'}, status=500)
-
-async def post_move(request):
-    payload = await request.json()
-    # Forward to ROS API or relevant robot endpoint
-    async with ClientSession() as session:
-        async with session.post(f"{ROS_API_URL}/move", json=payload) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return web.json_response(data)
-            else:
-                return web.json_response({'error': 'Failed to move'}, status=500)
-
-routes = [
-    web.get('/video.mjpg', mjpeg_stream),
-    web.get('/status', get_status),
-    web.post('/task', post_task),
-    web.post('/move', post_move),
-]
-
-app = web.Application()
-app.add_routes(routes)
-
-if __name__ == '__main__':
-    web.run_app(app, host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT)
+        shutdown_server()
