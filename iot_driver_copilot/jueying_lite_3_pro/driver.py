@@ -2,107 +2,120 @@ import os
 import io
 import json
 import asyncio
+from typing import Optional
+from fastapi import FastAPI, Request, Response, status
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel
 import aiohttp
-import socket
-import struct
-import threading
-from typing import Dict, Any
-from aiohttp import web
-import cv2
-import numpy as np
 
-# --- Environment Variables ---
-DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
-ROS_UDP_PORT = int(os.environ.get("ROS_UDP_PORT", "9000"))
-RTSP_URL = os.environ.get("RTSP_URL", f"rtsp://{DEVICE_IP}/video")
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+# ============ Environment Variables ============
+ROBOT_IP = os.environ.get('DEVICE_IP', '127.0.0.1')
+ROS_API_PORT = int(os.environ.get('ROS_API_PORT', '9090'))  # For ROSBridge websocket API
+UDP_PORT = int(os.environ.get('UDP_PORT', '15000'))         # For UDP status data (simulate if not used)
+RTSP_URL = os.environ.get('RTSP_URL', f'rtsp://{ROBOT_IP}/video')  # RTSP stream URL
+HTTP_SERVER_HOST = os.environ.get('HTTP_SERVER_HOST', '0.0.0.0')
+HTTP_SERVER_PORT = int(os.environ.get('HTTP_SERVER_PORT', '8000'))
 
-# --- ROS/UDP helpers ---
-def parse_udp_packet(packet: bytes) -> Dict[str, Any]:
-    # For demo: interpret as JSON. Adapt for real binary ROS/UDP protocols.
-    try:
-        return json.loads(packet.decode('utf-8'))
-    except Exception:
-        return {}
+# ============ FastAPI App ============
+app = FastAPI()
 
-def udp_listener(status_cache):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((DEVICE_IP, ROS_UDP_PORT))
-    while True:
-        data, _ = sock.recvfrom(65535)
-        parsed = parse_udp_packet(data)
-        if parsed:
-            status_cache.update(parsed)
+# ============ Models ============
+class TaskRequest(BaseModel):
+    action: str  # e.g., "start" or "stop"
+    script: str  # e.g., "SLAM", "LiDAR", "navigation"
 
-status_cache = {}
-udp_thread = threading.Thread(target=udp_listener, args=(status_cache,), daemon=True)
-udp_thread.start()
+class MoveRequest(BaseModel):
+    linear_x: float
+    linear_y: Optional[float] = 0.0
+    linear_z: Optional[float] = 0.0
+    angular_x: Optional[float] = 0.0
+    angular_y: Optional[float] = 0.0
+    angular_z: float
 
-# --- MJPEG HTTP stream from RTSP ---
-def mjpeg_stream_generator(rtsp_url):
-    cap = cv2.VideoCapture(rtsp_url)
-    if not cap.isOpened():
-        yield (b'')
-        return
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        _, jpeg = cv2.imencode('.jpg', frame)
-        if not _:
-            continue
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-    cap.release()
+# ============ ROSBridge Util (WebSocket for ROS API) ============
+async def ros_send_cmd_vel(cmd: dict):
+    """
+    Send /cmd_vel via ROSBridge websocket.
+    """
+    import websockets
+    uri = f"ws://{ROBOT_IP}:{ROS_API_PORT}"
+    ros_message = {
+        "op": "publish",
+        "topic": "/cmd_vel",
+        "msg": cmd
+    }
+    async with websockets.connect(uri) as ws:
+        await ws.send(json.dumps(ros_message))
+        # Optionally, receive response (ROSBridge may not respond for 'publish')
 
-# --- HTTP Server ---
-routes = web.RouteTableDef()
-
-@routes.get('/status')
-async def get_status(request):
-    # Return a snapshot of the latest status_cache
-    return web.json_response(status_cache)
-
-@routes.post('/move')
-async def post_move(request):
-    # Expects JSON: {"linear": {"x": ..., "y": ..., ...}, "angular": {"z": ...}}
-    data = await request.json()
-    # Send velocity command over UDP in JSON for demo; adapt for ROS binary if needed.
-    cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    cmd_json = json.dumps({
-        "cmd_vel": data
-    })
-    cmd_sock.sendto(cmd_json.encode('utf-8'), (DEVICE_IP, ROS_UDP_PORT))
-    cmd_sock.close()
-    return web.json_response({"result": "sent", "data": data})
-
-@routes.post('/task')
-async def post_task(request):
-    # Expects JSON: {"action": "start"/"stop", "script": "SLAM"/"LiDAR"/"Navigation"}
-    data = await request.json()
-    # For demo, just cache task state. In real device, trigger actual scripts.
-    status_cache['tasks'] = status_cache.get('tasks', {})
-    status_cache['tasks'][data.get("script")] = data.get("action")
-    return web.json_response({"result": "ok", "updated": status_cache['tasks']})
-
-@routes.get('/video')
-async def video_stream(request):
-    resp = web.StreamResponse(
-        status=200,
-        reason='OK',
-        headers={
-            'Content-Type': 'multipart/x-mixed-replace; boundary=frame'
+# ============ Status Fetcher Example (UDP or ROSBridge) ============
+async def fetch_status():
+    # Placeholder: In real case, fetch from UDP or ROSBridge topic
+    # Here simulate with static data for example purposes
+    return {
+        "localization": {"x": 1.23, "y": 4.56, "theta": 0.78},
+        "navigation": {"status": "idle", "target": None},
+        "sensors": {
+            "imu": {"accel": [0.01, 0.02, 9.81], "gyro": [0.0, 0.0, 0.001]},
+            "ultrasound": [1.2, 1.1, 0.9, 1.3]
         }
-    )
-    await resp.prepare(request)
-    for frame in mjpeg_stream_generator(RTSP_URL):
-        await resp.write(frame)
-    return resp
+    }
 
-# --- App Run ---
-app = web.Application()
-app.add_routes(routes)
+# ============ RTSP to HTTP MJPEG Proxy ============
+async def rtsp_to_mjpeg_stream(rtsp_url):
+    """
+    Connect to RTSP, extract MJPEG stream, yield as HTTP multipart stream.
+    Only works if RTSP stream is already MJPEG or JPEG-over-RTP.
+    """
+    import av
+    import cv2
+    import numpy as np
 
-if __name__ == '__main__':
-    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
+    container = av.open(rtsp_url)
+    for frame in container.decode(video=0):
+        img = frame.to_ndarray(format='bgr24')
+        ret, jpg = cv2.imencode('.jpg', img)
+        if not ret:
+            continue
+        mjpeg_frame = jpg.tobytes()
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n"
+            b"Content-Length: " + str(len(mjpeg_frame)).encode() + b"\r\n\r\n" +
+            mjpeg_frame + b"\r\n"
+        )
+
+# ============ API Endpoints ============
+
+@app.post("/task")
+async def manage_task(req: TaskRequest):
+    # In a real implementation, interact with ROS API or system scripts here
+    # Placeholder: Return JSON response
+    return JSONResponse({"status": "success", "action": req.action, "script": req.script})
+
+@app.get("/status")
+async def get_status():
+    data = await fetch_status()
+    return JSONResponse(data)
+
+@app.post("/move")
+async def send_move(req: MoveRequest):
+    # Prepare ROS message
+    cmd = {
+        "linear": {"x": req.linear_x, "y": req.linear_y, "z": req.linear_z},
+        "angular": {"x": req.angular_x, "y": req.angular_y, "z": req.angular_z}
+    }
+    await ros_send_cmd_vel(cmd)
+    return JSONResponse({"result": "command sent", "cmd": cmd})
+
+@app.get("/video")
+async def video_stream():
+    async def streamer():
+        async for chunk in rtsp_to_mjpeg_stream(RTSP_URL):
+            yield chunk
+    return StreamingResponse(streamer(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+# ============ Main Entrypoint ============
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT, reload=False)
