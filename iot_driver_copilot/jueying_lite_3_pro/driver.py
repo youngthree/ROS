@@ -6,112 +6,104 @@ import aiohttp.web
 import cv2
 import numpy as np
 
-# Env vars
-DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
-ROS_API_HOST = os.environ.get("ROS_API_HOST", "127.0.0.1")
-ROS_API_PORT = int(os.environ.get("ROS_API_PORT", 5000))
-RTSP_URL = os.environ.get("RTSP_URL", f"rtsp://{DEVICE_IP}/camera")
-HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
-HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", 8080))
-# Only configure ports/protocols actually used
+# ENVIRONMENT CONFIGURATION
+ROBOT_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
+ROS_API_URL = os.environ.get("ROS_API_URL", f"http://{ROBOT_IP}:8000")
+RTSP_URL = os.environ.get("RTSP_URL", f"rtsp://{ROBOT_IP}:8554/live")
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "80"))  # for video streaming
 
 routes = aiohttp.web.RouteTableDef()
 
-# --- Helper for RTSP to HTTP MJPEG conversion ---
-async def mjpeg_stream_response(rtsp_url):
-    # Use OpenCV to capture RTSP stream and yield JPEG frames over HTTP
-    cap = cv2.VideoCapture(rtsp_url)
-    if not cap.isOpened():
-        raise aiohttp.web.HTTPInternalServerError(reason="Could not open RTSP stream.")
+# --------- /task: Manage operational scripts (POST) ----------
+@routes.post('/task')
+async def manage_task(request):
+    data = await request.json()
+    action = data.get("action")
+    script_type = data.get("script_type")
+    if not action or not script_type:
+        return aiohttp.web.json_response({"error": "Missing 'action' or 'script_type'"}, status=400)
+    # Simulate script management (in real system, trigger ROS service or REST endpoint)
+    # Here, we assume an HTTP API for script control is available on the robot
     try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                await asyncio.sleep(0.05)
-                continue
-            ret, jpeg = cv2.imencode('.jpg', frame)
-            if not ret:
-                continue
-            jpg_bytes = jpeg.tobytes()
-            yield (b"--frame\r\n"
-                   b"Content-Type: image/jpeg\r\n\r\n" +
-                   jpg_bytes + b"\r\n")
-            await asyncio.sleep(0.04)  # ~25 FPS
-    finally:
-        cap.release()
+        async with aiohttp.ClientSession() as session:
+            resp = await session.post(
+                f"{ROS_API_URL}/scripts/manage", 
+                json={"action": action, "type": script_type},
+                timeout=5
+            )
+            result = await resp.json()
+            return aiohttp.web.json_response(result, status=resp.status)
+    except Exception as e:
+        return aiohttp.web.json_response({"error": str(e)}, status=502)
 
+# --------- /status: Get status data (GET) ----------
+@routes.get('/status')
+async def get_status(request):
+    # Simulate fetching sensor/status data from REST API or ROS bridge
+    try:
+        async with aiohttp.ClientSession() as session:
+            resp = await session.get(f"{ROS_API_URL}/status", timeout=5)
+            result = await resp.json()
+            return aiohttp.web.json_response(result, status=resp.status)
+    except Exception as e:
+        return aiohttp.web.json_response({"error": str(e)}, status=502)
+
+# --------- /move: Send movement command (POST) ----------
+@routes.post('/move')
+async def move_robot(request):
+    data = await request.json()
+    # Expects {"linear": ..., "angular": ...} or compatible
+    try:
+        async with aiohttp.ClientSession() as session:
+            resp = await session.post(
+                f"{ROS_API_URL}/cmd_vel",
+                json=data,
+                timeout=3
+            )
+            if resp.status == 200:
+                return aiohttp.web.json_response({"status": "ok"})
+            else:
+                return aiohttp.web.json_response({"error": "ROS API error"}, status=resp.status)
+    except Exception as e:
+        return aiohttp.web.json_response({"error": str(e)}, status=502)
+
+# --------- /video: Proxy RTSP to HTTP MJPEG stream (GET) ----------
 @routes.get('/video')
-async def video_feed(request):
-    response = aiohttp.web.StreamResponse(
-        status=200,
-        reason='OK',
-        headers={
-            'Content-Type': 'multipart/x-mixed-replace; boundary=frame'
-        }
-    )
+async def mjpeg_video(request):
+    async def video_stream(resp):
+        cap = cv2.VideoCapture(RTSP_URL)
+        if not cap.isOpened():
+            await resp.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
+            await resp.write(cv2.imencode('.jpg', np.zeros((480,640,3), np.uint8))[1].tobytes())
+            await resp.write(b"\r\n")
+            return
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    await asyncio.sleep(0.05)
+                    continue
+                _, jpeg = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+                await resp.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg.tobytes() + b"\r\n")
+                await asyncio.sleep(0.04)  # ~25 FPS
+        finally:
+            cap.release()
+
+    headers = {
+        "Content-Type": "multipart/x-mixed-replace; boundary=frame",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache"
+    }
+    response = aiohttp.web.StreamResponse(status=200, reason='OK', headers=headers)
     await response.prepare(request)
-    async for chunk in mjpeg_stream_response(RTSP_URL):
-        await response.write(chunk)
+    await video_stream(response)
     return response
 
-# --- API: POST /task ---
-@routes.post('/task')
-async def task_handler(request):
-    """
-    Manage operational scripts such as SLAM, LiDAR, or navigation.
-    Payload: {"action": "start"/"stop", "script_type": "slam"/"lidar"/"navigation"}
-    """
-    try:
-        data = await request.json()
-        action = data.get("action")
-        script_type = data.get("script_type")
-        if action not in ["start", "stop"] or script_type not in ["slam", "lidar", "navigation"]:
-            return aiohttp.web.json_response({"error": "Invalid action or script_type"}, status=400)
-        # Forward command to ROS API or device
-        async with aiohttp.ClientSession() as session:
-            url = f"http://{ROS_API_HOST}:{ROS_API_PORT}/driver/script"
-            payload = {"action": action, "script_type": script_type}
-            async with session.post(url, json=payload) as resp:
-                resp_data = await resp.json()
-        return aiohttp.web.json_response(resp_data)
-    except Exception as e:
-        return aiohttp.web.json_response({"error": str(e)}, status=500)
-
-# --- API: GET /status ---
-@routes.get('/status')
-async def status_handler(request):
-    """
-    Fetch current status data including localization and navigation metrics.
-    """
-    try:
-        async with aiohttp.ClientSession() as session:
-            url = f"http://{ROS_API_HOST}:{ROS_API_PORT}/driver/status"
-            async with session.get(url) as resp:
-                data = await resp.json()
-        return aiohttp.web.json_response(data)
-    except Exception as e:
-        return aiohttp.web.json_response({"error": str(e)}, status=500)
-
-# --- API: POST /move ---
-@routes.post('/move')
-async def move_handler(request):
-    """
-    Send movement commands to the robot.
-    Payload: {"linear": {"x": float, "y": float, "z": float}, "angular": {"x": float, "y": float, "z": float}}
-    """
-    try:
-        data = await request.json()
-        async with aiohttp.ClientSession() as session:
-            url = f"http://{ROS_API_HOST}:{ROS_API_PORT}/driver/move"
-            async with session.post(url, json=data) as resp:
-                resp_data = await resp.json()
-        return aiohttp.web.json_response(resp_data)
-    except Exception as e:
-        return aiohttp.web.json_response({"error": str(e)}, status=500)
-
-# --- App startup ---
+# --------- Server setup ----------
 app = aiohttp.web.Application()
 app.add_routes(routes)
 
-if __name__ == "__main__":
-    aiohttp.web.run_app(app, host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT)
+if __name__ == '__main__':
+    aiohttp.web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
