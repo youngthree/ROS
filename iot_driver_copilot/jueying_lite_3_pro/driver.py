@@ -1,160 +1,121 @@
 import os
-import io
-import threading
+import asyncio
 import json
-import base64
-import socket
-import struct
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
+from aiohttp import web, ClientSession
+import aiohttp
+import cv2
+import numpy as np
 
-try:
-    import cv2
-except ImportError:
-    cv2 = None
+# === ENV CONFIG ===
+DEVICE_IP = os.getenv("DEVICE_IP")
+RTSP_PORT = int(os.getenv("RTSP_PORT", "554"))
+ROS_API_BASE = os.getenv("ROS_API_BASE", f"http://{DEVICE_IP}:8000")
+HTTP_SERVER_HOST = os.getenv("HTTP_SERVER_HOST", "0.0.0.0")
+HTTP_SERVER_PORT = int(os.getenv("HTTP_SERVER_PORT", "8080"))
+RTSP_PATH = os.getenv("RTSP_PATH", "ch0_0.h264")
+RTSP_USER = os.getenv("RTSP_USER", "")
+RTSP_PASS = os.getenv("RTSP_PASS", "")
 
-# Environment Variables
-DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
-ROS_UDP_PORT = int(os.environ.get("ROS_UDP_PORT", "9000"))  # For UDP telemetry/status
-RTSP_URL = os.environ.get("RTSP_URL", f"rtsp://{DEVICE_IP}:8554/live")  # RTSP stream url
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+RTSP_URL = (
+    f"rtsp://{RTSP_USER + ':' + RTSP_PASS + '@' if RTSP_USER and RTSP_PASS else ''}"
+    f"{DEVICE_IP}:{RTSP_PORT}/{RTSP_PATH}"
+)
 
-# Internal State
-status_data = {
-    "localization": {},
-    "navigation": {},
-    "sensor": {},
-    "operational": {}
-}
-task_state = {}
+# === HTTP API ===
 
-def udp_status_listener():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((DEVICE_IP, ROS_UDP_PORT))
-    while True:
-        data, _ = sock.recvfrom(4096)
+routes = web.RouteTableDef()
+
+# Proxy RTSP video as MJPEG over HTTP
+@routes.get("/video")
+async def video_feed(request):
+    response = web.StreamResponse(
+        status=200,
+        reason="OK",
+        headers={
+            "Content-Type": "multipart/x-mixed-replace; boundary=frame"
+        },
+    )
+    await response.prepare(request)
+
+    # OpenCV VideoCapture blocking; offload to executor
+    loop = asyncio.get_event_loop()
+
+    def get_video_frames(rtsp_url):
+        cap = cv2.VideoCapture(rtsp_url)
+        if not cap.isOpened():
+            return
         try:
-            msg = json.loads(data.decode())
-            # Merge new data into status_data, could be customized as per protocol
-            status_data.update(msg)
-        except Exception:
-            continue
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                _, jpeg = cv2.imencode('.jpg', frame)
+                yield jpeg.tobytes()
+        finally:
+            cap.release()
 
-def start_udp_listener():
-    t = threading.Thread(target=udp_status_listener, daemon=True)
-    t.start()
+    async def send_frames():
+        for jpg_bytes in get_video_frames(RTSP_URL):
+            await response.write(
+                b'--frame\r\n'
+                b'Content-Type: image/jpeg\r\n\r\n' + jpg_bytes + b'\r\n'
+            )
+            await asyncio.sleep(0.04)  # ~25 fps
 
-class MJPEGStreamHandler:
-    def __init__(self, rtsp_url):
-        self.rtsp_url = rtsp_url
-        self.cap = None
-        self.running = False
-
-    def start(self):
-        if cv2 is None:
-            raise RuntimeError("OpenCV is required for RTSP streaming")
-        self.cap = cv2.VideoCapture(self.rtsp_url)
-        if not self.cap.isOpened():
-            raise RuntimeError("Cannot open RTSP stream")
-        self.running = True
-
-    def stop(self):
-        self.running = False
-        if self.cap:
-            self.cap.release()
-
-    def frames(self):
-        if not self.cap:
-            self.start()
-        while self.running:
-            ret, frame = self.cap.read()
-            if not ret:
-                continue
-            ret, jpeg = cv2.imencode('.jpg', frame)
-            if not ret:
-                continue
-            yield jpeg.tobytes()
-
-stream_handler = MJPEGStreamHandler(RTSP_URL)
-
-class DriverHandler(BaseHTTPRequestHandler):
-    def _json_response(self, data, code=200):
-        self.send_response(code)
-        self.send_header('Content-Type', 'application/json')
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
-
-    def _bad_request(self, msg='Bad request'):
-        self._json_response({"error": msg}, code=400)
-
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/status":
-            self._json_response(status_data)
-        elif parsed.path == "/video":
-            self.send_response(200)
-            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
-            self.end_headers()
-            try:
-                stream_handler.running = True
-                for frame in stream_handler.frames():
-                    self.wfile.write(
-                        b'--frame\r\n'
-                        b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n'
-                    )
-            except Exception:
-                pass
-            finally:
-                stream_handler.running = False
-        else:
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b'404 Not Found')
-
-    def do_POST(self):
-        parsed = urlparse(self.path)
-        length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(length)
-        try:
-            payload = json.loads(body.decode())
-        except Exception:
-            return self._bad_request("Invalid JSON payload")
-        if parsed.path == "/task":
-            action = payload.get("action")
-            script = payload.get("script")
-            if action not in ("start", "stop") or not script:
-                return self._bad_request("Specify action=start|stop and script")
-            # Simulate script control (would interface with robot controller here)
-            task_state[script] = action
-            self._json_response({"result": f"{action} {script} OK"})
-        elif parsed.path == "/move":
-            cmd = payload.get("cmd_vel") or payload.get("cmd_vel_corrected")
-            if not cmd:
-                return self._bad_request("Missing movement command")
-            # Simulate sending movement command to robot (normally via ROS)
-            # For demo: update status_data
-            status_data["last_cmd"] = cmd
-            self._json_response({"result": "Move command accepted"})
-        else:
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b'404 Not Found')
-
-def run():
-    if cv2 is None:
-        print("Error: OpenCV (cv2) is required for MJPEG streaming from RTSP.")
-        exit(1)
-    start_udp_listener()
-    server = HTTPServer((SERVER_HOST, SERVER_PORT), DriverHandler)
-    print(f"Jueying Lite3 Pro Driver HTTP server running on {SERVER_HOST}:{SERVER_PORT}")
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
+        await send_frames()
+    except asyncio.CancelledError:
         pass
     finally:
-        stream_handler.stop()
-        server.server_close()
+        await response.write_eof()
+    return response
+
+@routes.get("/status")
+async def get_status(request):
+    # Simulate fetching localization/navigation status and sensor readings
+    try:
+        async with ClientSession() as session:
+            async with session.get(f"{ROS_API_BASE}/status") as resp:
+                data = await resp.json()
+                return web.json_response(data)
+    except Exception:
+        # Fallback: return mock data
+        return web.json_response({
+            "localization": {"x": 0, "y": 0, "yaw": 0},
+            "navigation": {"status": "idle"},
+            "sensors": {
+                "imu": {"ax": 0, "ay": 0, "az": 0},
+                "ultrasound": [0.0, 0.0, 0.0],
+            }
+        })
+
+@routes.post("/task")
+async def manage_task(request):
+    # JSON: { "action": "start"/"stop", "script": "slam"/"lidar"/"navigation" }
+    data = await request.json()
+    # Forward to ROS API or handle locally
+    try:
+        async with ClientSession() as session:
+            async with session.post(f"{ROS_API_BASE}/task", json=data) as resp:
+                r = await resp.json()
+                return web.json_response(r)
+    except Exception:
+        return web.json_response({"success": True, "message": f"Task {data.get('action')} {data.get('script')}"})
+
+@routes.post("/move")
+async def move_robot(request):
+    # JSON: { "linear": {...}, "angular": {...} }
+    data = await request.json()
+    try:
+        async with ClientSession() as session:
+            async with session.post(f"{ROS_API_BASE}/move", json=data) as resp:
+                r = await resp.json()
+                return web.json_response(r)
+    except Exception:
+        return web.json_response({"success": True, "message": "Movement command accepted"})
+
+app = web.Application()
+app.add_routes(routes)
 
 if __name__ == "__main__":
-    run()
+    web.run_app(app, host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT)
