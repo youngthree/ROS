@@ -3,107 +3,134 @@ import asyncio
 import json
 import aiohttp
 import aiohttp.web
+import websockets
 import cv2
 import numpy as np
 
-# ENVIRONMENT CONFIGURATION
-ROBOT_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
-ROS_API_URL = os.environ.get("ROS_API_URL", f"http://{ROBOT_IP}:8000")
-RTSP_URL = os.environ.get("RTSP_URL", f"rtsp://{ROBOT_IP}:8554/live")
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
-JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "80"))  # for video streaming
+# --- ENVIRONMENT VARIABLES ---
+DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
+ROS_API_HOST = os.environ.get("ROS_API_HOST", DEVICE_IP)
+ROS_API_PORT = int(os.environ.get("ROS_API_PORT", "9090"))
+RTSP_URL = os.environ.get("RTSP_URL", f"rtsp://{DEVICE_IP}/live")
+HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
+HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8000"))
+
+# --- ROS HTTP API ENDPOINTS (assumed for demonstration) ---
+ROS_CMD_VEL_TOPIC = os.environ.get("ROS_CMD_VEL_TOPIC", "/cmd_vel")
+ROS_NAV_STATUS_TOPIC = os.environ.get("ROS_NAV_STATUS_TOPIC", "/navigation/status")
+ROS_LOCALIZATION_TOPIC = os.environ.get("ROS_LOCALIZATION_TOPIC", "/localization/status")
+ROS_SCRIPT_API_URL = os.environ.get("ROS_SCRIPT_API_URL", f"http://{ROS_API_HOST}:{ROS_API_PORT}/scripts")
+
+# --- HTTP SERVER ---
 
 routes = aiohttp.web.RouteTableDef()
 
-# --------- /task: Manage operational scripts (POST) ----------
-@routes.post('/task')
-async def manage_task(request):
-    data = await request.json()
-    action = data.get("action")
-    script_type = data.get("script_type")
-    if not action or not script_type:
-        return aiohttp.web.json_response({"error": "Missing 'action' or 'script_type'"}, status=400)
-    # Simulate script management (in real system, trigger ROS service or REST endpoint)
-    # Here, we assume an HTTP API for script control is available on the robot
-    try:
-        async with aiohttp.ClientSession() as session:
-            resp = await session.post(
-                f"{ROS_API_URL}/scripts/manage", 
-                json={"action": action, "type": script_type},
-                timeout=5
-            )
-            result = await resp.json()
-            return aiohttp.web.json_response(result, status=resp.status)
-    except Exception as e:
-        return aiohttp.web.json_response({"error": str(e)}, status=502)
+# -- UTILS --
 
-# --------- /status: Get status data (GET) ----------
-@routes.get('/status')
-async def get_status(request):
-    # Simulate fetching sensor/status data from REST API or ROS bridge
-    try:
-        async with aiohttp.ClientSession() as session:
-            resp = await session.get(f"{ROS_API_URL}/status", timeout=5)
-            result = await resp.json()
-            return aiohttp.web.json_response(result, status=resp.status)
-    except Exception as e:
-        return aiohttp.web.json_response({"error": str(e)}, status=502)
-
-# --------- /move: Send movement command (POST) ----------
-@routes.post('/move')
-async def move_robot(request):
-    data = await request.json()
-    # Expects {"linear": ..., "angular": ...} or compatible
-    try:
-        async with aiohttp.ClientSession() as session:
-            resp = await session.post(
-                f"{ROS_API_URL}/cmd_vel",
-                json=data,
-                timeout=3
-            )
-            if resp.status == 200:
-                return aiohttp.web.json_response({"status": "ok"})
-            else:
-                return aiohttp.web.json_response({"error": "ROS API error"}, status=resp.status)
-    except Exception as e:
-        return aiohttp.web.json_response({"error": str(e)}, status=502)
-
-# --------- /video: Proxy RTSP to HTTP MJPEG stream (GET) ----------
-@routes.get('/video')
-async def mjpeg_video(request):
-    async def video_stream(resp):
-        cap = cv2.VideoCapture(RTSP_URL)
-        if not cap.isOpened():
-            await resp.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
-            await resp.write(cv2.imencode('.jpg', np.zeros((480,640,3), np.uint8))[1].tobytes())
-            await resp.write(b"\r\n")
-            return
-        try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    await asyncio.sleep(0.05)
-                    continue
-                _, jpeg = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
-                await resp.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg.tobytes() + b"\r\n")
-                await asyncio.sleep(0.04)  # ~25 FPS
-        finally:
-            cap.release()
-
-    headers = {
-        "Content-Type": "multipart/x-mixed-replace; boundary=frame",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache"
+async def fetch_navigation_status():
+    # Placeholder: Fetch navigation/localization/status from ROS API or UDP endpoint
+    # Here we simulate with dummy data for demonstration
+    status = {
+        "localization": {"x": 1.23, "y": 4.56, "theta": 0.78},
+        "navigation": {"active": True, "goal": [2.0, 3.0]},
+        "sensors": {
+            "imu": {"linear_acceleration": [0.01, 0.0, 9.8]},
+            "ultrasound_distance": [1.2, 2.5, 0.8]
+        }
     }
-    response = aiohttp.web.StreamResponse(status=200, reason='OK', headers=headers)
+    return status
+
+async def ros_publish_cmd_vel(cmd):
+    async with aiohttp.ClientSession() as session:
+        url = f"http://{ROS_API_HOST}:{ROS_API_PORT}/rosapi/publish"
+        payload = {
+            "topic": ROS_CMD_VEL_TOPIC,
+            "msg": cmd
+        }
+        async with session.post(url, json=payload) as resp:
+            return await resp.text()
+
+async def manage_script(action, script_type):
+    async with aiohttp.ClientSession() as session:
+        url = f"{ROS_SCRIPT_API_URL}/{script_type}/{action}"
+        async with session.post(url) as resp:
+            return await resp.text()
+
+# --- API ENDPOINTS ---
+
+@routes.post('/move')
+async def move(request):
+    try:
+        data = await request.json()
+        # Forward cmd_vel to ROS (assume JSON matches ROS message for geometry_msgs/Twist)
+        result = await ros_publish_cmd_vel(data)
+        return aiohttp.web.json_response({"result": result})
+    except Exception as e:
+        return aiohttp.web.json_response({"error": str(e)}, status=400)
+
+@routes.get('/status')
+async def status(request):
+    # Fetch status data from ROS/UDP/etc.
+    status = await fetch_navigation_status()
+    return aiohttp.web.json_response(status)
+
+@routes.post('/task')
+async def task(request):
+    try:
+        data = await request.json()
+        action = data.get("action", "start")
+        script_type = data.get("script_type", "slam")
+        result = await manage_script(action, script_type)
+        return aiohttp.web.json_response({"result": result})
+    except Exception as e:
+        return aiohttp.web.json_response({"error": str(e)}, status=400)
+
+# --- MJPEG VIDEO STREAM (RTSP -> HTTP) ---
+
+async def mjpeg_video_stream(request):
+    # Use OpenCV to connect to RTSP and yield as HTTP multipart
+    boundary = "frame"
+    response = aiohttp.web.StreamResponse(
+        status=200,
+        reason='OK',
+        headers={
+            'Content-Type': f'multipart/x-mixed-replace; boundary={boundary}',
+            'Cache-Control': 'no-cache',
+            'Connection': 'close',
+            'Pragma': 'no-cache',
+        }
+    )
     await response.prepare(request)
-    await video_stream(response)
+    cap = cv2.VideoCapture(RTSP_URL)
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                await asyncio.sleep(0.1)
+                continue
+            ret, jpeg = cv2.imencode('.jpg', frame)
+            if not ret:
+                continue
+            await response.write(
+                b"--" + boundary.encode() + b"\r\n"
+                + b"Content-Type: image/jpeg\r\n"
+                + f"Content-Length: {len(jpeg)}\r\n\r\n".encode()
+                + jpeg.tobytes() + b"\r\n"
+            )
+            await asyncio.sleep(0.033)  # ~30fps
+    except asyncio.CancelledError:
+        pass
+    finally:
+        cap.release()
+        await response.write_eof()
     return response
 
-# --------- Server setup ----------
+routes.get('/video')(mjpeg_video_stream)
+
+# --- MAIN ---
+
 app = aiohttp.web.Application()
 app.add_routes(routes)
 
-if __name__ == '__main__':
-    aiohttp.web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
+if __name__ == "__main__":
+    aiohttp.web.run_app(app, host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT)
