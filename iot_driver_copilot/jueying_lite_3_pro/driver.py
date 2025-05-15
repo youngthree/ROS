@@ -1,102 +1,127 @@
 import os
 import asyncio
 import json
-from typing import Optional
-from fastapi import FastAPI, HTTPException, Request, Response, status
-from fastapi.responses import StreamingResponse, JSONResponse
+from aiohttp import web, ClientSession
 import aiohttp
 import cv2
 import numpy as np
 
-# Environment Variables for Configuration
-DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
-ROS_API_URL = os.environ.get("ROS_API_URL", f"http://{DEVICE_IP}:5000")
-RTSP_URL = os.environ.get("RTSP_URL", f"rtsp://{DEVICE_IP}/live")
-HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
-HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8080"))
-RTSP_USERNAME = os.environ.get("RTSP_USERNAME", "")
-RTSP_PASSWORD = os.environ.get("RTSP_PASSWORD", "")
-# Only use RTSP and HTTP server ports because only those are needed for the driver.
+# Environment variable configuration
+DEVICE_IP = os.getenv('DEVICE_IP', '127.0.0.1')
+ROS_API_URL = os.getenv('ROS_API_URL', f'http://{DEVICE_IP}:8080')
+RTSP_URL = os.getenv('RTSP_URL', f'rtsp://{DEVICE_IP}/live')
+SERVER_HOST = os.getenv('SERVER_HOST', '0.0.0.0')
+SERVER_PORT = int(os.getenv('SERVER_PORT', '8000'))
 
-app = FastAPI()
+# ---- Helper Functions ----
 
-# Helper: MJPEG generator from RTSP stream using OpenCV
-def mjpeg_stream(rtsp_url):
-    cap = cv2.VideoCapture(rtsp_url)
+async def fetch_status():
+    # Fetch localization & navigation status from ROS REST API or UDP endpoint (simulate as needed)
+    url = f'{ROS_API_URL}/status'
+    try:
+        async with ClientSession() as session:
+            async with session.get(url, timeout=3) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                else:
+                    return {"error": "Failed to fetch status", "code": resp.status}
+    except Exception as e:
+        return {"error": str(e)}
+
+async def send_move_command(data):
+    # Send velocity commands via ROS REST API (simulate as needed)
+    url = f'{ROS_API_URL}/move'
+    try:
+        async with ClientSession() as session:
+            async with session.post(url, json=data, timeout=3) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                else:
+                    return {"error": "Failed to send move command", "code": resp.status}
+    except Exception as e:
+        return {"error": str(e)}
+
+async def manage_task(data):
+    # Start/Stop SLAM/LIDAR/Navigation via ROS REST API (simulate as needed)
+    url = f'{ROS_API_URL}/task'
+    try:
+        async with ClientSession() as session:
+            async with session.post(url, json=data, timeout=3) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                else:
+                    return {"error": "Failed to manage task", "code": resp.status}
+    except Exception as e:
+        return {"error": str(e)}
+
+# ---- HTTP Handlers ----
+
+async def status_handler(request):
+    result = await fetch_status()
+    return web.json_response(result)
+
+async def move_handler(request):
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+    result = await send_move_command(data)
+    return web.json_response(result)
+
+async def task_handler(request):
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+    result = await manage_task(data)
+    return web.json_response(result)
+
+async def mjpeg_stream_handler(request):
+    # Proxy RTSP to HTTP MJPEG stream
+    response = web.StreamResponse(
+        status=200,
+        reason='OK',
+        headers={
+            'Content-Type': 'multipart/x-mixed-replace; boundary=frame'
+        }
+    )
+    await response.prepare(request)
+    cap = cv2.VideoCapture(RTSP_URL)
     if not cap.isOpened():
-        cap.release()
-        raise HTTPException(status_code=502, detail="Unable to open RTSP stream")
+        await response.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
+        await response.write(b"\xff\xd8\xff\xe0" + b"NO VIDEO STREAM" + b"\xff\xd9")
+        await response.write(b"\r\n")
+        await response.write_eof()
+        return response
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
-                break
+                await asyncio.sleep(0.05)
+                continue
             ret, jpeg = cv2.imencode('.jpg', frame)
             if not ret:
                 continue
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+            img_bytes = jpeg.tobytes()
+            await response.write(
+                b'--frame\r\n'
+                b'Content-Type: image/jpeg\r\n\r\n' + img_bytes + b'\r\n'
+            )
+            await asyncio.sleep(0.04)  # ~25fps
+    except asyncio.CancelledError:
+        pass
     finally:
         cap.release()
+        await response.write_eof()
+    return response
 
-# API: Manage operational scripts (SLAM, LiDAR, navigation)
-@app.post("/task")
-async def manage_task(request: Request):
-    try:
-        data = await request.json()
-        action = data.get('action')
-        script_type = data.get('script_type')
-        if not action or not script_type:
-            raise HTTPException(status_code=400, detail="Missing 'action' or 'script_type'")
-        # Example: POST to ROS API or internal script manager
-        ros_url = f"{ROS_API_URL}/task"
-        async with aiohttp.ClientSession() as session:
-            async with session.post(ros_url, json={"action": action, "script_type": script_type}) as resp:
-                resp_data = await resp.json()
-                return JSONResponse(content=resp_data, status_code=resp.status)
-    except Exception as ex:
-        return JSONResponse(content={"error": str(ex)}, status_code=500)
+# ---- Application ----
 
-# API: Fetch current status data (localization, navigation, sensor readings)
-@app.get("/status")
-async def get_status():
-    try:
-        ros_url = f"{ROS_API_URL}/status"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(ros_url) as resp:
-                if resp.status != 200:
-                    raise HTTPException(status_code=resp.status, detail="Failed to fetch status")
-                resp_data = await resp.json()
-                return JSONResponse(content=resp_data)
-    except Exception as ex:
-        return JSONResponse(content={"error": str(ex)}, status_code=500)
+app = web.Application()
+app.router.add_get('/status', status_handler)
+app.router.add_post('/move', move_handler)
+app.router.add_post('/task', task_handler)
+app.router.add_get('/video', mjpeg_stream_handler)
 
-# API: Send robot movement commands (cmd_vel, etc.)
-@app.post("/move")
-async def send_move(request: Request):
-    try:
-        data = await request.json()
-        # Forward as-is to ROS API, adjust endpoint as needed for your ROS bridge.
-        ros_url = f"{ROS_API_URL}/move"
-        async with aiohttp.ClientSession() as session:
-            async with session.post(ros_url, json=data) as resp:
-                resp_data = await resp.json()
-                return JSONResponse(content=resp_data, status_code=resp.status)
-    except Exception as ex:
-        return JSONResponse(content={"error": str(ex)}, status_code=500)
-
-# API: Video streaming as MJPEG over HTTP (browser/CLI compatible)
-@app.get("/video")
-async def video_stream():
-    # Build RTSP url with credentials if provided
-    global RTSP_URL
-    rtsp_url = RTSP_URL
-    if RTSP_USERNAME and RTSP_PASSWORD and "@" not in RTSP_URL:
-        proto, rest = RTSP_URL.split("://", 1)
-        rtsp_url = f"{proto}://{RTSP_USERNAME}:{RTSP_PASSWORD}@{rest}"
-    return StreamingResponse(mjpeg_stream(rtsp_url), media_type="multipart/x-mixed-replace; boundary=frame")
-
-# Start server
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT, reload=False)
+    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
