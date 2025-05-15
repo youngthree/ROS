@@ -1,111 +1,117 @@
 import os
-import io
 import asyncio
 import json
-import cv2
-import numpy as np
-from aiohttp import web
-from aiohttp import MultipartWriter
+from typing import Optional
 
-# -------------------- Environment Variables --------------------
-DEVICE_IP = os.environ.get('DEVICE_IP', '127.0.0.1')
-SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
-RTSP_PORT = int(os.environ.get('RTSP_PORT', '554'))
-RTSP_PATH = os.environ.get('RTSP_PATH', '/stream1')
-ROS_MASTER_URI = os.environ.get('ROS_MASTER_URI', f'http://{DEVICE_IP}:11311')
-# (Other configs can be added as needed)
+from fastapi import FastAPI, Request, Response, status
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel
 
-# -------------------- HTTP Server Handlers --------------------
+import socket
+import struct
 
-routes = web.RouteTableDef()
+# ---- ENV CONFIG ----
 
-# --------- 1. /task: Manage operational scripts (SLAM, LiDAR, Navigation) ---------
-@routes.post('/task')
-async def task_handler(request):
+ROBOT_IP = os.environ.get("ROBOT_IP")
+ROBOT_UDP_PORT = int(os.environ.get("ROBOT_UDP_PORT", "9000"))
+HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
+HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
+
+if not ROBOT_IP:
+    raise RuntimeError("ROBOT_IP environment variable must be set.")
+
+# ---- UDP COMMUNICATION HELPERS ----
+
+class UDPClient:
+    def __init__(self, ip: str, port: int, timeout: float = 2.0):
+        self.addr = (ip, port)
+        self.timeout = timeout
+
+    async def send_and_receive(self, msg: bytes, expected_len: Optional[int] = None) -> bytes:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._sync_send_and_receive, msg, expected_len)
+
+    def _sync_send_and_receive(self, msg: bytes, expected_len: Optional[int]):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(self.timeout)
+            s.sendto(msg, self.addr)
+            try:
+                data, _ = s.recvfrom(expected_len or 65536)
+                return data
+            except socket.timeout:
+                raise TimeoutError("No response from robot via UDP.")
+
+udp_client = UDPClient(ROBOT_IP, ROBOT_UDP_PORT)
+
+# ---- ROS/UDP MESSAGE ENCODING/DECODING ----
+
+# For demonstration, we use simple JSON over UDP for both /state (request/response) and /move (command/ack)
+# In a real implementation, encode/decode according to the robot's binary or ROS protocol.
+
+# ---- FASTAPI MODELS ----
+
+class MoveCommand(BaseModel):
+    linear_x: float
+    linear_y: Optional[float] = 0.0
+    linear_z: Optional[float] = 0.0
+    angular_x: Optional[float] = 0.0
+    angular_y: Optional[float] = 0.0
+    angular_z: float
+
+# ---- FASTAPI APP ----
+
+app = FastAPI()
+
+@app.get("/state")
+async def get_state():
+    # Send a request for current state (example: '{"cmd":"get_state"}')
+    request_msg = json.dumps({"cmd": "get_state"}).encode("utf-8")
     try:
-        payload = await request.json()
-    except Exception:
-        return web.json_response({'error': 'Invalid JSON'}, status=400)
-    action = payload.get('action')
-    script_type = payload.get('script_type')
-    # Here should be integration with actual process management (e.g., ROS services/calls)
-    # For now, simulate:
-    result = {'status': 'ok', 'action': action, 'script_type': script_type}
-    return web.json_response(result)
-
-# --------- 2. /status: Fetch current status data (localization, navigation, sensors) ---------
-@routes.get('/status')
-async def status_handler(request):
-    # Simulate status data (in real device, fetch from ROS, UDP, etc.)
-    status_data = {
-        'localization': {'x': 1.23, 'y': 3.21, 'theta': 0.123},
-        'navigation_status': 'idle',
-        'battery': 87.5,
-        'imu': {'roll': 0.01, 'pitch': 0.02, 'yaw': 0.03},
-        'ultrasound_distance': [0.5, 0.7, 1.2, 0.9],
-        'yolov8_detection': [],
-        'joint_states': {'joint1': 0.1, 'joint2': -0.2},
-    }
-    return web.json_response(status_data)
-
-# --------- 3. /move: Send movement commands (velocity via JSON) ---------
-@routes.post('/move')
-async def move_handler(request):
-    try:
-        payload = await request.json()
-    except Exception:
-        return web.json_response({'error': 'Invalid JSON'}, status=400)
-    # In real system, publish to ROS topic or send over UDP
-    # Here, just echo back
-    return web.json_response({'status': 'received', 'cmd': payload})
-
-# --------- 4. /video: RTSP to HTTP MJPEG stream proxy ---------
-@routes.get('/video')
-async def video_handler(request):
-    rtsp_url = f'rtsp://{DEVICE_IP}:{RTSP_PORT}{RTSP_PATH}'
-    cap = cv2.VideoCapture(rtsp_url)
-    if not cap.isOpened():
-        return web.Response(status=503, text='Unable to connect to RTSP stream')
-
-    async def mjpeg_stream(writer):
+        raw = await udp_client.send_and_receive(request_msg)
+        # Assume response is JSON-encoded
         try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                ret, jpeg = cv2.imencode('.jpg', frame)
-                if not ret:
-                    continue
-                img_bytes = jpeg.tobytes()
-                await writer.write(
-                    b'--frame\r\n'
-                    b'Content-Type: image/jpeg\r\n\r\n' +
-                    img_bytes +
-                    b'\r\n'
-                )
-                await asyncio.sleep(0.04)  # ~25 FPS
-        finally:
-            cap.release()
+            data = json.loads(raw.decode("utf-8"))
+            return JSONResponse(content=data)
+        except Exception:
+            # If not JSON, just return as a binary blob
+            return Response(content=raw, media_type="application/octet-stream")
+    except TimeoutError:
+        return JSONResponse(status_code=status.HTTP_504_GATEWAY_TIMEOUT, content={"error": "No response from robot"})
 
-    resp = web.StreamResponse(
-        status=200,
-        reason='OK',
-        headers={'Content-Type': 'multipart/x-mixed-replace; boundary=frame'}
-    )
-    await resp.prepare(request)
-    await mjpeg_stream(resp)
-    return resp
+@app.post("/move")
+async def post_move(cmd: MoveCommand):
+    # Send move command to robot (example: '{"cmd":"move", "vel": {...}}')
+    move_payload = {
+        "cmd": "move",
+        "vel": {
+            "linear": {
+                "x": cmd.linear_x,
+                "y": cmd.linear_y,
+                "z": cmd.linear_z
+            },
+            "angular": {
+                "x": cmd.angular_x,
+                "y": cmd.angular_y,
+                "z": cmd.angular_z
+            }
+        }
+    }
+    request_msg = json.dumps(move_payload).encode("utf-8")
+    try:
+        raw = await udp_client.send_and_receive(request_msg)
+        try:
+            data = json.loads(raw.decode("utf-8"))
+            return JSONResponse(content=data)
+        except Exception:
+            return Response(content=raw, media_type="application/octet-stream")
+    except TimeoutError:
+        return JSONResponse(status_code=status.HTTP_504_GATEWAY_TIMEOUT, content={"error": "No response from robot"})
 
-# -------------------- App Setup --------------------
-
-app = web.Application()
-app.add_routes(routes)
-
-# -------------------- Main Entry --------------------
+# ---- MAIN ENTRYPOINT ----
 
 def main():
-    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
+    import uvicorn
+    uvicorn.run(app, host=HTTP_HOST, port=HTTP_PORT)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
