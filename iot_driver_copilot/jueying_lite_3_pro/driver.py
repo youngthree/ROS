@@ -1,155 +1,111 @@
 import os
 import io
-import json
 import asyncio
-import struct
-from typing import Optional
-from fastapi import FastAPI, Request, Response, BackgroundTasks, status
-from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
-from fastapi.middleware.cors import CORSMiddleware
-import httpx
-import uvicorn
+import json
+import cv2
+import numpy as np
+from aiohttp import web
+from aiohttp import MultipartWriter
 
-# Environment Variables
-DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
-ROS_API_PORT = int(os.environ.get("ROS_API_PORT", "9090"))  # For HTTP JSON bridge or similar if any
-RTSP_PORT = int(os.environ.get("RTSP_PORT", "554"))
-RTSP_PATH = os.environ.get("RTSP_PATH", "/stream1")
-STATUS_UDP_PORT = int(os.environ.get("STATUS_UDP_PORT", "10001"))
-COMMAND_UDP_PORT = int(os.environ.get("COMMAND_UDP_PORT", "10002"))
+# -------------------- Environment Variables --------------------
+DEVICE_IP = os.environ.get('DEVICE_IP', '127.0.0.1')
+SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
+SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
+RTSP_PORT = int(os.environ.get('RTSP_PORT', '554'))
+RTSP_PATH = os.environ.get('RTSP_PATH', '/stream1')
+ROS_MASTER_URI = os.environ.get('ROS_MASTER_URI', f'http://{DEVICE_IP}:11311')
+# (Other configs can be added as needed)
 
-app = FastAPI(
-    title="Jueying Lite3 Pro HTTP Driver",
-    description="HTTP Server Driver for Jueying Lite3 Pro Mobile Robot Platform"
-)
+# -------------------- HTTP Server Handlers --------------------
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+routes = web.RouteTableDef()
 
-# --------- RTSP Proxy: RTSP -> HTTP MJPEG/Multipart Stream ---------
-import av
-
-async def rtsp_to_mjpeg_generator(rtsp_url):
-    """Async generator converting RTSP H264 stream to multipart MJPEG for HTTP streaming."""
+# --------- 1. /task: Manage operational scripts (SLAM, LiDAR, Navigation) ---------
+@routes.post('/task')
+async def task_handler(request):
     try:
-        container = av.open(rtsp_url, options={"rtsp_transport": "tcp"})
-        video_stream = next(s for s in container.streams if s.type == 'video')
-        for frame in container.decode(video=0):
-            img = frame.to_image()
-            buf = io.BytesIO()
-            img.save(buf, format='JPEG')
-            jpg_data = buf.getvalue()
-            buf.close()
-            boundary = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg_data + b"\r\n"
-            yield boundary
-    except Exception as e:
-        yield b"--frame\r\nContent-Type: text/plain\r\n\r\nError: %s\r\n" % str(e).encode()
-
-@app.get("/video")
-async def video_stream():
-    """
-    HTTP MJPEG stream proxied from device's RTSP stream.
-    """
-    rtsp_url = f"rtsp://{DEVICE_IP}:{RTSP_PORT}{RTSP_PATH}"
-    return StreamingResponse(
-        rtsp_to_mjpeg_generator(rtsp_url),
-        media_type="multipart/x-mixed-replace; boundary=frame"
-    )
-
-# --------- /move: UDP Command Forwarder ---------
-import socket
-
-def send_udp_cmd(data: bytes, port: int) -> bool:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.sendto(data, (DEVICE_IP, port))
-        return True
+        payload = await request.json()
     except Exception:
-        return False
+        return web.json_response({'error': 'Invalid JSON'}, status=400)
+    action = payload.get('action')
+    script_type = payload.get('script_type')
+    # Here should be integration with actual process management (e.g., ROS services/calls)
+    # For now, simulate:
+    result = {'status': 'ok', 'action': action, 'script_type': script_type}
+    return web.json_response(result)
 
-@app.post("/move")
-async def move(request: Request):
-    """
-    Send movement commands to the robot via UDP.
-    Accepts JSON payload, serializes, and sends to robot.
-    """
-    payload = await request.json()
+# --------- 2. /status: Fetch current status data (localization, navigation, sensors) ---------
+@routes.get('/status')
+async def status_handler(request):
+    # Simulate status data (in real device, fetch from ROS, UDP, etc.)
+    status_data = {
+        'localization': {'x': 1.23, 'y': 3.21, 'theta': 0.123},
+        'navigation_status': 'idle',
+        'battery': 87.5,
+        'imu': {'roll': 0.01, 'pitch': 0.02, 'yaw': 0.03},
+        'ultrasound_distance': [0.5, 0.7, 1.2, 0.9],
+        'yolov8_detection': [],
+        'joint_states': {'joint1': 0.1, 'joint2': -0.2},
+    }
+    return web.json_response(status_data)
+
+# --------- 3. /move: Send movement commands (velocity via JSON) ---------
+@routes.post('/move')
+async def move_handler(request):
     try:
-        # Example: Expect {"linear": {"x": float, "y": float, "z": float}, "angular": {"x": float, "y": float, "z": float}}
-        # Serialize to struct (example only, adjust to actual protocol)
-        linear = payload.get("linear", {})
-        angular = payload.get("angular", {})
-        data = struct.pack(
-            "ffffff",
-            float(linear.get("x", 0)),
-            float(linear.get("y", 0)),
-            float(linear.get("z", 0)),
-            float(angular.get("x", 0)),
-            float(angular.get("y", 0)),
-            float(angular.get("z", 0))
-        )
-        ok = send_udp_cmd(data, COMMAND_UDP_PORT)
-        if not ok:
-            return JSONResponse({"status": "error", "detail": "Failed to send UDP command"}, status_code=500)
-        return {"status": "ok"}
-    except Exception as e:
-        return JSONResponse({"status": "error", "detail": str(e)}, status_code=400)
+        payload = await request.json()
+    except Exception:
+        return web.json_response({'error': 'Invalid JSON'}, status=400)
+    # In real system, publish to ROS topic or send over UDP
+    # Here, just echo back
+    return web.json_response({'status': 'received', 'cmd': payload})
 
-# --------- /task: Manage operational scripts (Start/Stop) ---------
-# For demo, just UDP message with a JSON-encoded action+type
-@app.post("/task")
-async def task(request: Request):
-    """
-    Manage operational scripts such as SLAM, LiDAR, or navigation.
-    JSON: {"action": "start"/"stop", "type": "slam"/"lidar"/"navigation"}
-    """
-    payload = await request.json()
-    action = payload.get("action")
-    type_ = payload.get("type")
-    if action not in ("start", "stop") or not type_:
-        return JSONResponse({"status": "error", "detail": "Invalid action or type"}, status_code=400)
-    # Send UDP command as JSON
-    msg = json.dumps({"action": action, "type": type_}).encode()
-    ok = send_udp_cmd(msg, COMMAND_UDP_PORT)
-    if not ok:
-        return JSONResponse({"status": "error", "detail": "Failed to send UDP command"}, status_code=500)
-    return {"status": "ok"}
+# --------- 4. /video: RTSP to HTTP MJPEG stream proxy ---------
+@routes.get('/video')
+async def video_handler(request):
+    rtsp_url = f'rtsp://{DEVICE_IP}:{RTSP_PORT}{RTSP_PATH}'
+    cap = cv2.VideoCapture(rtsp_url)
+    if not cap.isOpened():
+        return web.Response(status=503, text='Unable to connect to RTSP stream')
 
-# --------- /status: UDP Status Fetcher (One-shot) ---------
-@app.get("/status")
-async def status():
-    """
-    Fetch current status data including localization and navigation metrics via UDP (one-shot request-response).
-    """
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.settimeout(1.5)
-            # Send a "status" request (protocol-specific, adjust as needed)
-            s.sendto(b'status', (DEVICE_IP, STATUS_UDP_PORT))
-            data, _ = s.recvfrom(8192)
-            try:
-                # Try to decode as JSON
-                result = json.loads(data.decode())
-                return JSONResponse(result)
-            except Exception:
-                # Return as plain text if not JSON
-                return PlainTextResponse(data)
-    except socket.timeout:
-        return JSONResponse({"status": "error", "detail": "Timeout fetching status"}, status_code=504)
-    except Exception as e:
-        return JSONResponse({"status": "error", "detail": str(e)}, status_code=500)
+    async def mjpeg_stream(writer):
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                ret, jpeg = cv2.imencode('.jpg', frame)
+                if not ret:
+                    continue
+                img_bytes = jpeg.tobytes()
+                await writer.write(
+                    b'--frame\r\n'
+                    b'Content-Type: image/jpeg\r\n\r\n' +
+                    img_bytes +
+                    b'\r\n'
+                )
+                await asyncio.sleep(0.04)  # ~25 FPS
+        finally:
+            cap.release()
 
-if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host=SERVER_HOST,
-        port=SERVER_PORT,
-        reload=False
+    resp = web.StreamResponse(
+        status=200,
+        reason='OK',
+        headers={'Content-Type': 'multipart/x-mixed-replace; boundary=frame'}
     )
+    await resp.prepare(request)
+    await mjpeg_stream(resp)
+    return resp
+
+# -------------------- App Setup --------------------
+
+app = web.Application()
+app.add_routes(routes)
+
+# -------------------- Main Entry --------------------
+
+def main():
+    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
+
+if __name__ == '__main__':
+    main()
