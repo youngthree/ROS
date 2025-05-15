@@ -1,165 +1,134 @@
 import os
-import sys
-import io
-import threading
+import asyncio
 import json
-import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
-import socket
-import struct
+import aiohttp
+import aiohttp.web
+import websockets
+import cv2
+import numpy as np
 
-# Configuration from environment
+# Environment Variables
 DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
-ROS_UDP_PORT = int(os.environ.get("ROS_UDP_PORT", "9000"))
+ROS_API_URL = os.environ.get("ROS_API_URL", f"http://{DEVICE_IP}:9090")
 RTSP_URL = os.environ.get("RTSP_URL", f"rtsp://{DEVICE_IP}/live")
-HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
-HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8080"))
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+HTTP_VIDEO_PATH = os.environ.get("HTTP_VIDEO_PATH", "/video")
+HTTP_VIDEO_WS_PATH = os.environ.get("HTTP_VIDEO_WS_PATH", "/video/ws")
 
-# For demo: mock robot status data
-robot_status = {
-    "localization": {"x": 1.0, "y": 2.0, "theta": 0.5},
-    "navigation": {"active": True, "goal": [5, 5]},
-    "sensors": {"imu": {"yaw": 0.01, "pitch": 0.02, "roll": 0.03}},
-    "timestamp": time.time()
-}
-robot_status_lock = threading.Lock()
+# Helper function: get robot status (simulate ROS/REST API or UDP)
+async def get_status():
+    # Simulate data, replace with real ROS/REST/UDP retrieval if available
+    return {
+        "localization": {"x": 1.23, "y": 4.56, "theta": 0.78},
+        "navigation_status": "IDLE",
+        "imu": {"ax": 0.01, "ay": 0.02, "az": 9.81},
+        "ultrasound_distance": [0.23, 0.21, 0.19, 0.22],
+        "joint_states": {"joint1": 0.1, "joint2": -0.2},
+        "handle_state": "NEUTRAL"
+    }
 
-# For demo: mock task state
-task_state = {
-    "slam": False,
-    "lidar": False,
-    "navigation": False
-}
-task_state_lock = threading.Lock()
+# Helper function: send movement command (simulate ROS/REST API or UDP)
+async def send_move_command(cmd):
+    # Here, send to ROS or UDP as per device's API
+    # Simulate success
+    return {"result": "ok", "sent": cmd}
 
-# UDP ROS Message Listener (for status simulation)
-def udp_ros_listener():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+# Helper function: manage tasks (simulate ROS/REST API or SSH)
+async def manage_task(action, script_type):
+    # Here, start/stop SLAM/LiDAR/Navigation etc. via API
+    # Simulate success
+    return {"result": "ok", "action": action, "script_type": script_type}
+
+# HTTP Handlers
+async def handle_status(request):
+    status = await get_status()
+    return aiohttp.web.json_response(status)
+
+async def handle_move(request):
+    data = await request.json()
+    resp = await send_move_command(data)
+    return aiohttp.web.json_response(resp)
+
+async def handle_task(request):
+    data = await request.json()
+    action = data.get("action")
+    script_type = data.get("script_type")
+    resp = await manage_task(action, script_type)
+    return aiohttp.web.json_response(resp)
+
+# Video Streaming to HTTP MJPEG
+async def mjpeg_stream(request):
+    # Connect to RTSP and transcode to MJPEG on the fly
+    cap = cv2.VideoCapture(RTSP_URL)
+    if not cap.isOpened():
+        return aiohttp.web.Response(status=503, text="Unable to open RTSP stream.")
+    response = aiohttp.web.StreamResponse(
+        status=200,
+        reason='OK',
+        headers={
+            'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
+            'Cache-Control': 'no-cache',
+            'Connection': 'close'
+        }
+    )
+    await response.prepare(request)
     try:
-        sock.bind((DEVICE_IP, ROS_UDP_PORT))
-    except Exception as e:
-        print(f"Could not bind UDP socket: {e}", file=sys.stderr)
-        return
-    while True:
-        data, _ = sock.recvfrom(4096)
-        # Parse fake data for status
-        try:
-            msg = json.loads(data.decode())
-            with robot_status_lock:
-                robot_status.update(msg)
-                robot_status["timestamp"] = time.time()
-        except Exception:
-            continue
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            ret, jpg = cv2.imencode('.jpg', frame)
+            if not ret:
+                continue
+            await response.write(b'--frame\r\n')
+            await response.write(b'Content-Type: image/jpeg\r\n\r\n')
+            await response.write(jpg.tobytes())
+            await response.write(b'\r\n')
+            await asyncio.sleep(0.04)  # ~25fps
+    except asyncio.CancelledError:
+        pass
+    finally:
+        cap.release()
+    await response.write_eof()
+    return response
 
-udp_thread = threading.Thread(target=udp_ros_listener, daemon=True)
-udp_thread.start()
+# Video streaming to WebSocket (JPEG frames for browser)
+async def ws_video_handler(request):
+    ws = aiohttp.web.WebSocketResponse()
+    await ws.prepare(request)
+    cap = cv2.VideoCapture(RTSP_URL)
+    if not cap.isOpened():
+        await ws.send_json({"error": "Unable to open RTSP stream."})
+        await ws.close()
+        return ws
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            ret, jpg = cv2.imencode('.jpg', frame)
+            if not ret:
+                continue
+            await ws.send_bytes(jpg.tobytes())
+            await asyncio.sleep(0.04)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        cap.release()
+        await ws.close()
+    return ws
 
-# RTSP-to-MJPEG proxy (raw, simple implementation)
-def parse_h264_nal_units(data):
-    """Find NAL units in H264 stream for demonstration.
-    This does not decode H264, but splits NALs for example MJPEG conversion."""
-    nals = []
-    i = 0
-    while True:
-        start = data.find(b'\x00\x00\x00\x01', i)
-        if start == -1:
-            break
-        next_start = data.find(b'\x00\x00\x00\x01', start + 4)
-        if next_start == -1:
-            nals.append(data[start:])
-            break
-        nals.append(data[start:next_start])
-        i = next_start
-    return nals
+# Application Factory
+def create_app():
+    app = aiohttp.web.Application()
+    app.router.add_get('/status', handle_status)
+    app.router.add_post('/move', handle_move)
+    app.router.add_post('/task', handle_task)
+    app.router.add_get(HTTP_VIDEO_PATH, mjpeg_stream)
+    app.router.add_get(HTTP_VIDEO_WS_PATH, ws_video_handler)
+    return app
 
-def h264_to_mjpeg_generator(rtsp_url):
-    # NOTE: No external tools, so no ffmpeg/gst. This will not produce a real MJPEG,
-    # but as a placeholder, we just yield "fake" JPEG frames for demonstration.
-    # In a real implementation, you would use a built-in python H264 decoder,
-    # but such does not exist in standard library.
-    boundary = "--frame"
-    while True:
-        # Simulate a JPEG frame (black image)
-        jpg = (
-            b'\xff\xd8' + b'\xff' * 1000 + b'\xff\xd9'
-        )  # not a real image, just for stream test
-        yield (
-            f"{boundary}\r\nContent-Type: image/jpeg\r\nContent-Length: {len(jpg)}\r\n\r\n".encode()
-            + jpg + b"\r\n"
-        )
-        time.sleep(0.1)
-
-class RequestHandler(BaseHTTPRequestHandler):
-    def _set_headers(self, status=200, content_type="application/json"):
-        self.send_response(status)
-        self.send_header('Content-type', content_type)
-        self.end_headers()
-
-    def do_GET(self):
-        url_parts = urlparse(self.path)
-        if url_parts.path == "/status":
-            with robot_status_lock:
-                data = json.dumps(robot_status).encode()
-            self._set_headers(200, "application/json")
-            self.wfile.write(data)
-        elif url_parts.path == "/video":
-            # MJPEG Stream
-            self.send_response(200)
-            self.send_header(
-                'Content-type',
-                'multipart/x-mixed-replace; boundary=--frame'
-            )
-            self.end_headers()
-            try:
-                for frame in h264_to_mjpeg_generator(RTSP_URL):
-                    self.wfile.write(frame)
-                    self.wfile.flush()
-            except (ConnectionResetError, BrokenPipeError):
-                pass
-        else:
-            self._set_headers(404)
-            self.wfile.write(b'{"error":"Not Found"}')
-
-    def do_POST(self):
-        url_parts = urlparse(self.path)
-        content_length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(content_length) if content_length > 0 else b""
-        if url_parts.path == "/move":
-            # Expect JSON: {"linear": {"x": float, "y": float}, "angular": {"z": float}}
-            try:
-                cmd = json.loads(body.decode())
-                # In a real implementation, publish to ROS/UDP topic
-                # For now, just log and return accepted
-                self._set_headers(200)
-                self.wfile.write(json.dumps({"result":"accepted", "command":cmd}).encode())
-            except Exception as e:
-                self._set_headers(400)
-                self.wfile.write(json.dumps({"error":str(e)}).encode())
-        elif url_parts.path == "/task":
-            # Expect JSON: {"action": "start"/"stop", "script": "slam"/"lidar"/"navigation"}
-            try:
-                req = json.loads(body.decode())
-                action = req.get("action")
-                script = req.get("script")
-                if action not in ["start", "stop"] or script not in task_state:
-                    raise ValueError("Invalid action or script")
-                with task_state_lock:
-                    task_state[script] = (action == "start")
-                self._set_headers(200)
-                self.wfile.write(json.dumps({"result":f"{action}ed {script}"}).encode())
-            except Exception as e:
-                self._set_headers(400)
-                self.wfile.write(json.dumps({"error":str(e)}).encode())
-        else:
-            self._set_headers(404)
-            self.wfile.write(b'{"error":"Not Found"}')
-
-def run_server():
-    server_address = (HTTP_SERVER_HOST, HTTP_SERVER_PORT)
-    httpd = HTTPServer(server_address, RequestHandler)
-    print(f"Driver HTTP server running at http://{HTTP_SERVER_HOST}:{HTTP_SERVER_PORT}/")
-    httpd.serve_forever()
-
-if __name__ == "__main__":
-    run_server()
+if __name__ == '__main__':
+    app = create_app()
+    aiohttp.web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
