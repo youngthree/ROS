@@ -2,159 +2,154 @@ import os
 import io
 import json
 import asyncio
+import struct
 from typing import Optional
 from fastapi import FastAPI, Request, Response, BackgroundTasks, status
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
-import aiohttp
+import httpx
+import uvicorn
 
-# --- Environment Variables ---
+# Environment Variables
 DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
-DEVICE_ROSBRIDGE_PORT = int(os.environ.get("DEVICE_ROSBRIDGE_PORT", "9090"))  # For ROS API (websocket/json)
-DEVICE_RTSP_PORT = int(os.environ.get("DEVICE_RTSP_PORT", "554"))  # For RTSP camera
-DRIVER_HOST = os.environ.get("DRIVER_HOST", "0.0.0.0")
-DRIVER_PORT = int(os.environ.get("DRIVER_PORT", "8080"))
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+ROS_API_PORT = int(os.environ.get("ROS_API_PORT", "9090"))  # For HTTP JSON bridge or similar if any
+RTSP_PORT = int(os.environ.get("RTSP_PORT", "554"))
+RTSP_PATH = os.environ.get("RTSP_PATH", "/stream1")
+STATUS_UDP_PORT = int(os.environ.get("STATUS_UDP_PORT", "10001"))
+COMMAND_UDP_PORT = int(os.environ.get("COMMAND_UDP_PORT", "10002"))
 
-# --- RTSP credentials (optional) ---
-RTSP_USERNAME = os.environ.get("RTSP_USERNAME", "")
-RTSP_PASSWORD = os.environ.get("RTSP_PASSWORD", "")
-RTSP_PATH = os.environ.get("RTSP_PATH", "/stream")
-
-# --- FastAPI setup ---
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
+app = FastAPI(
+    title="Jueying Lite3 Pro HTTP Driver",
+    description="HTTP Server Driver for Jueying Lite3 Pro Mobile Robot Platform"
 )
 
-# --- Minimal ROS JSON API (rosbridge) client ---
-import websockets  # stdlib asyncio websockets
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-async def ros_call(service: str, args: dict) -> dict:
-    uri = f"ws://{DEVICE_IP}:{DEVICE_ROSBRIDGE_PORT}"
-    async with websockets.connect(uri) as ws:
-        req = {
-            "op": "call_service",
-            "service": service,
-            "args": args,
-            "id": "rosdriver"
-        }
-        await ws.send(json.dumps(req))
-        async for msg in ws:
-            data = json.loads(msg)
-            if data.get("id") == "rosdriver" and data.get("op") == "service_response":
-                return data.get("values", {})
-    return {}
+# --------- RTSP Proxy: RTSP -> HTTP MJPEG/Multipart Stream ---------
+import av
 
-async def ros_publish(topic: str, msg_type: str, msg: dict):
-    uri = f"ws://{DEVICE_IP}:{DEVICE_ROSBRIDGE_PORT}"
-    async with websockets.connect(uri) as ws:
-        req = {
-            "op": "publish",
-            "topic": topic,
-            "msg": msg,
-            "id": "rosdriver"
-        }
-        await ws.send(json.dumps(req))
-        await asyncio.sleep(0.2)
-
-async def ros_subscribe_once(topic: str):
-    uri = f"ws://{DEVICE_IP}:{DEVICE_ROSBRIDGE_PORT}"
-    async with websockets.connect(uri) as ws:
-        subscribe_msg = {
-            "op": "subscribe",
-            "topic": topic,
-            "id": "rosdriver"
-        }
-        await ws.send(json.dumps(subscribe_msg))
-        async for msg in ws:
-            data = json.loads(msg)
-            if data.get("topic") == topic and data.get("op") == "publish":
-                return data.get("msg", {})
-
-# --- /task ---
-@app.post("/task")
-async def manage_task(request: Request):
-    payload = await request.json()
-    action = payload.get("action")
-    script_type = payload.get("script_type")
-    # In real device: map to ROS service or topic
-    # Here: Just simulate as a ROS service call (you may need to adapt service name)
-    service_name = f"/{script_type}_script_service"
-    args = {"action": action}
+async def rtsp_to_mjpeg_generator(rtsp_url):
+    """Async generator converting RTSP H264 stream to multipart MJPEG for HTTP streaming."""
     try:
-        result = await ros_call(service_name, args)
-        return JSONResponse({"result": result})
+        container = av.open(rtsp_url, options={"rtsp_transport": "tcp"})
+        video_stream = next(s for s in container.streams if s.type == 'video')
+        for frame in container.decode(video=0):
+            img = frame.to_image()
+            buf = io.BytesIO()
+            img.save(buf, format='JPEG')
+            jpg_data = buf.getvalue()
+            buf.close()
+            boundary = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg_data + b"\r\n"
+            yield boundary
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-# --- /status ---
-@app.get("/status")
-async def get_status():
-    # Example: fetch from ROS topics
-    status_data = {}
-    try:
-        status_data["localization"] = await ros_subscribe_once("/localization_status")
-    except Exception:
-        status_data["localization"] = None
-    try:
-        status_data["navigation"] = await ros_subscribe_once("/navigation_status")
-    except Exception:
-        status_data["navigation"] = None
-    try:
-        status_data["imu"] = await ros_subscribe_once("/imu/data")
-    except Exception:
-        status_data["imu"] = None
-    try:
-        status_data["joint_states"] = await ros_subscribe_once("/joint_states")
-    except Exception:
-        status_data["joint_states"] = None
-    return status_data
-
-# --- /move ---
-@app.post("/move")
-async def move(request: Request):
-    payload = await request.json()
-    # Assume payload is geometry_msgs/Twist
-    try:
-        await ros_publish("/cmd_vel", "geometry_msgs/Twist", payload)
-        return {"success": True}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-# --- RTSP proxy to HTTP MJPEG ---
-from PIL import Image
-import cv2
-import numpy as np
-
-def build_rtsp_url():
-    auth = ""
-    if RTSP_USERNAME:
-        auth = f"{RTSP_USERNAME}:{RTSP_PASSWORD}@" if RTSP_PASSWORD else f"{RTSP_USERNAME}@"
-    return f"rtsp://{auth}{DEVICE_IP}:{DEVICE_RTSP_PORT}{RTSP_PATH}"
-
-async def gen_mjpeg():
-    rtsp_url = build_rtsp_url()
-    cap = cv2.VideoCapture(rtsp_url)
-    if not cap.isOpened():
-        yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + b"\r\n"
-        return
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            await asyncio.sleep(0.1)
-            continue
-        _, jpeg = cv2.imencode('.jpg', frame)
-        frame_bytes = jpeg.tobytes()
-        yield (
-            b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
-        )
-        await asyncio.sleep(0.04)  # ~25 FPS
+        yield b"--frame\r\nContent-Type: text/plain\r\n\r\nError: %s\r\n" % str(e).encode()
 
 @app.get("/video")
 async def video_stream():
-    return StreamingResponse(gen_mjpeg(), media_type="multipart/x-mixed-replace; boundary=frame")
+    """
+    HTTP MJPEG stream proxied from device's RTSP stream.
+    """
+    rtsp_url = f"rtsp://{DEVICE_IP}:{RTSP_PORT}{RTSP_PATH}"
+    return StreamingResponse(
+        rtsp_to_mjpeg_generator(rtsp_url),
+        media_type="multipart/x-mixed-replace; boundary=frame"
+    )
+
+# --------- /move: UDP Command Forwarder ---------
+import socket
+
+def send_udp_cmd(data: bytes, port: int) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.sendto(data, (DEVICE_IP, port))
+        return True
+    except Exception:
+        return False
+
+@app.post("/move")
+async def move(request: Request):
+    """
+    Send movement commands to the robot via UDP.
+    Accepts JSON payload, serializes, and sends to robot.
+    """
+    payload = await request.json()
+    try:
+        # Example: Expect {"linear": {"x": float, "y": float, "z": float}, "angular": {"x": float, "y": float, "z": float}}
+        # Serialize to struct (example only, adjust to actual protocol)
+        linear = payload.get("linear", {})
+        angular = payload.get("angular", {})
+        data = struct.pack(
+            "ffffff",
+            float(linear.get("x", 0)),
+            float(linear.get("y", 0)),
+            float(linear.get("z", 0)),
+            float(angular.get("x", 0)),
+            float(angular.get("y", 0)),
+            float(angular.get("z", 0))
+        )
+        ok = send_udp_cmd(data, COMMAND_UDP_PORT)
+        if not ok:
+            return JSONResponse({"status": "error", "detail": "Failed to send UDP command"}, status_code=500)
+        return {"status": "ok"}
+    except Exception as e:
+        return JSONResponse({"status": "error", "detail": str(e)}, status_code=400)
+
+# --------- /task: Manage operational scripts (Start/Stop) ---------
+# For demo, just UDP message with a JSON-encoded action+type
+@app.post("/task")
+async def task(request: Request):
+    """
+    Manage operational scripts such as SLAM, LiDAR, or navigation.
+    JSON: {"action": "start"/"stop", "type": "slam"/"lidar"/"navigation"}
+    """
+    payload = await request.json()
+    action = payload.get("action")
+    type_ = payload.get("type")
+    if action not in ("start", "stop") or not type_:
+        return JSONResponse({"status": "error", "detail": "Invalid action or type"}, status_code=400)
+    # Send UDP command as JSON
+    msg = json.dumps({"action": action, "type": type_}).encode()
+    ok = send_udp_cmd(msg, COMMAND_UDP_PORT)
+    if not ok:
+        return JSONResponse({"status": "error", "detail": "Failed to send UDP command"}, status_code=500)
+    return {"status": "ok"}
+
+# --------- /status: UDP Status Fetcher (One-shot) ---------
+@app.get("/status")
+async def status():
+    """
+    Fetch current status data including localization and navigation metrics via UDP (one-shot request-response).
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(1.5)
+            # Send a "status" request (protocol-specific, adjust as needed)
+            s.sendto(b'status', (DEVICE_IP, STATUS_UDP_PORT))
+            data, _ = s.recvfrom(8192)
+            try:
+                # Try to decode as JSON
+                result = json.loads(data.decode())
+                return JSONResponse(result)
+            except Exception:
+                # Return as plain text if not JSON
+                return PlainTextResponse(data)
+    except socket.timeout:
+        return JSONResponse({"status": "error", "detail": "Timeout fetching status"}, status_code=504)
+    except Exception as e:
+        return JSONResponse({"status": "error", "detail": str(e)}, status_code=500)
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host=DRIVER_HOST, port=DRIVER_PORT, log_level="info")
+    uvicorn.run(
+        "main:app",
+        host=SERVER_HOST,
+        port=SERVER_PORT,
+        reload=False
+    )
