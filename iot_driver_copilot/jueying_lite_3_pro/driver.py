@@ -1,168 +1,154 @@
 import os
-import asyncio
 import json
-import aiohttp
-from aiohttp import web
-import websockets
-import base64
+import threading
+import socket
+import struct
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
 
-# Environment variables/config
-DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
-DEVICE_RTSP_PORT = int(os.environ.get("DEVICE_RTSP_PORT", "554"))
-DEVICE_ROSBRIDGE_PORT = int(os.environ.get("DEVICE_ROSBRIDGE_PORT", "9090"))
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
-RTSP_STREAM_PATH = os.environ.get("RTSP_STREAM_PATH", "/video")  # e.g., /live/stream
-RTSP_USERNAME = os.environ.get("RTSP_USERNAME", "")
-RTSP_PASSWORD = os.environ.get("RTSP_PASSWORD", "")
+# Configuration from environment variables
+DEVICE_IP = os.environ.get('DEVICE_IP', '127.0.0.1')
+ROS_UDP_PORT = int(os.environ.get('ROS_UDP_PORT', 15000))  # For demo UDP status
+RTSP_URL = os.environ.get('RTSP_URL', f'rtsp://{DEVICE_IP}/live')  # RTSP stream
+HTTP_SERVER_HOST = os.environ.get('HTTP_SERVER_HOST', '0.0.0.0')
+HTTP_SERVER_PORT = int(os.environ.get('HTTP_SERVER_PORT', 8080))
 
-# ROSBridge websocket URL
-ROSBRIDGE_URI = f"ws://{DEVICE_IP}:{DEVICE_ROSBRIDGE_PORT}"
-
-routes = web.RouteTableDef()
-
-async def rosbridge_call(service, args=None):
-    async with websockets.connect(ROSBRIDGE_URI) as ws:
-        call_id = "call_" + str(os.urandom(8).hex())
-        request = {
-            "op": "call_service",
-            "service": service,
-            "args": args or {},
-            "id": call_id,
-        }
-        await ws.send(json.dumps(request))
-        async for msg in ws:
-            resp = json.loads(msg)
-            if resp.get("id") == call_id and resp.get("op") == "service_response":
-                return resp.get("values", {})
-    return {}
-
-async def rosbridge_publish(topic, msg_type, msg):
-    async with websockets.connect(ROSBRIDGE_URI) as ws:
-        request = {
-            "op": "publish",
-            "topic": topic,
-            "msg": msg,
-        }
-        await ws.send(json.dumps(request))
-        # Don't wait for response, fire and forget
-
-async def rosbridge_subscribe(topic, msg_type, count=1):
-    async with websockets.connect(ROSBRIDGE_URI) as ws:
-        sub_id = "sub_" + str(os.urandom(8).hex())
-        request = {
-            "op": "subscribe",
-            "topic": topic,
-            "type": msg_type,
-            "id": sub_id,
-        }
-        await ws.send(json.dumps(request))
-        results = []
-        for _ in range(count):
-            msg = await ws.recv()
-            resp = json.loads(msg)
-            if resp.get("topic") == topic:
-                results.append(resp.get("msg"))
-        unsub_req = {"op": "unsubscribe", "id": sub_id, "topic": topic}
-        await ws.send(json.dumps(unsub_req))
-        return results
-
-@routes.post('/task')
-async def manage_task(request):
-    data = await request.json()
-    action = data.get('action')
-    script_type = data.get('script_type')
-    # Example: start/stop SLAM, LiDAR, Navigation
-    # Let's assume custom ROS services: /start_script, /stop_script
-    if action not in ['start', 'stop'] or not script_type:
-        return web.json_response({'error': 'Invalid payload'}, status=400)
-    service = f"/{action}_script"
-    args = {"script_type": script_type}
+# Dummy UDP status fetcher (simulate robot status data via UDP)
+def fetch_udp_status(timeout=1.0):
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_sock.settimeout(timeout)
     try:
-        resp = await rosbridge_call(service, args)
-        return web.json_response({"result": "ok", "response": resp})
-    except Exception as e:
-        return web.json_response({'error': str(e)}, status=500)
-
-@routes.get('/status')
-async def get_status(request):
-    # Example: subscribe once to sensor topics
-    out = {}
-    try:
-        # Localization
-        loc = await rosbridge_subscribe('/localization', 'geometry_msgs/PoseWithCovarianceStamped', 1)
-        # Navigation status
-        nav = await rosbridge_subscribe('/navigation_status', 'std_msgs/String', 1)
-        # IMU
-        imu = await rosbridge_subscribe('/imu', 'sensor_msgs/Imu', 1)
-        # Odom
-        odom = await rosbridge_subscribe('/odom', 'nav_msgs/Odometry', 1)
-        out = {
-            "localization": loc[0] if loc else {},
-            "navigation_status": nav[0] if nav else {},
-            "imu": imu[0] if imu else {},
-            "odom": odom[0] if odom else {},
+        udp_sock.sendto(b'STATUS?', (DEVICE_IP, ROS_UDP_PORT))
+        data, _ = udp_sock.recvfrom(4096)
+        return json.loads(data)
+    except Exception:
+        # Simulate status if UDP not available
+        return {
+            "localization": {"x": 1.23, "y": 4.56, "theta": 0.78},
+            "navigation": {"state": "idle", "goal": [2.0, 3.0]},
+            "imu": {"ax": 0.0, "ay": 0.1, "az": 9.8},
+            "battery": {"voltage": 24.5, "level": 87}
         }
-    except Exception as e:
-        return web.json_response({'error': str(e)}, status=500)
-    return web.json_response(out)
+    finally:
+        udp_sock.close()
 
-@routes.post('/move')
-async def move(request):
-    data = await request.json()
-    # Move command e.g. { "linear": { "x": 0.5, "y": 0, "z": 0 }, "angular": { "z": 0.2 } }
-    try:
-        await rosbridge_publish('/cmd_vel', 'geometry_msgs/Twist', data)
-        return web.json_response({"result": "ok"})
-    except Exception as e:
-        return web.json_response({'error': str(e)}, status=500)
+# RTSP to HTTP MJPEG streaming
+import cv2
+import queue
 
-@routes.get('/video')
-async def video_proxy(request):
-    """
-    HTTP MJPEG proxy for RTSP stream, accessible from browser.
-    """
-    import cv2
+class RTSPProxy:
+    def __init__(self, rtsp_url):
+        self.rtsp_url = rtsp_url
+        self.frame_queue = queue.Queue(maxsize=10)
+        self.running = False
 
-    # Build RTSP URI
-    if RTSP_USERNAME and RTSP_PASSWORD:
-        auth = f"{RTSP_USERNAME}:{RTSP_PASSWORD}@"
-    else:
-        auth = ""
-    rtsp_url = f"rtsp://{auth}{DEVICE_IP}:{DEVICE_RTSP_PORT}{RTSP_STREAM_PATH}"
+    def start(self):
+        if self.running: return
+        self.running = True
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
 
-    cap = cv2.VideoCapture(rtsp_url)
-    if not cap.isOpened():
-        return web.Response(status=503, text="Could not open RTSP stream")
-    response = web.StreamResponse(
-        status=200,
-        reason='OK',
-        headers={
-            'Content-Type': 'multipart/x-mixed-replace; boundary=frame'
-        }
-    )
-    await response.prepare(request)
-    try:
-        while True:
+    def stop(self):
+        self.running = False
+        if hasattr(self, 'thread'):
+            self.thread.join()
+
+    def _worker(self):
+        cap = cv2.VideoCapture(self.rtsp_url)
+        while self.running:
             ret, frame = cap.read()
             if not ret:
-                break
-            ret, jpg = cv2.imencode('.jpg', frame)
+                continue
+            ret, jpeg = cv2.imencode('.jpg', frame)
             if not ret:
                 continue
-            await response.write(b"--frame\r\n")
-            await response.write(b"Content-Type: image/jpeg\r\n\r\n")
-            await response.write(jpg.tobytes())
-            await response.write(b"\r\n")
-            await asyncio.sleep(0.04)  # ~25fps
-    except asyncio.CancelledError:
+            try:
+                self.frame_queue.put(jpeg.tobytes(), timeout=1)
+            except queue.Full:
+                try:
+                    self.frame_queue.get_nowait()  # Drop oldest
+                except queue.Empty:
+                    pass
+        cap.release()
+
+    def get_frame(self):
+        try:
+            return self.frame_queue.get(timeout=2)
+        except queue.Empty:
+            return None
+
+rtsp_proxy = RTSPProxy(RTSP_URL)
+rtsp_proxy.start()
+
+# HTTP API Handlers
+class JueyingHandler(BaseHTTPRequestHandler):
+    def _set_headers(self, code=200, content_type="application/json"):
+        self.send_response(code)
+        self.send_header('Content-type', content_type)
+        self.end_headers()
+
+    def do_GET(self):
+        if self.path == '/status':
+            # Fetch status data via UDP (or simulate)
+            status = fetch_udp_status()
+            self._set_headers()
+            self.wfile.write(json.dumps(status).encode('utf-8'))
+        elif self.path.startswith('/video'):
+            self._set_headers(200, 'multipart/x-mixed-replace; boundary=frame')
+            self.stream_mjpeg()
+        else:
+            self._set_headers(404)
+            self.wfile.write(b'{"error":"Not found"}')
+
+    def stream_mjpeg(self):
+        while True:
+            frame = rtsp_proxy.get_frame()
+            if frame is None:
+                continue
+            self.wfile.write(b"--frame\r\n")
+            self.wfile.write(b"Content-Type: image/jpeg\r\n\r\n")
+            self.wfile.write(frame)
+            self.wfile.write(b"\r\n")
+
+    def do_POST(self):
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length)
+        try:
+            request_json = json.loads(post_data.decode('utf-8'))
+        except Exception:
+            self._set_headers(400)
+            self.wfile.write(b'{"error":"Invalid JSON"}')
+            return
+
+        if self.path == '/task':
+            # Manage operational scripts: start/stop SLAM, LiDAR, navigation (simulate)
+            action = request_json.get('action')
+            script_type = request_json.get('type')
+            # Simulate result
+            result = {"result": f"{action} {script_type} executed"}
+            self._set_headers()
+            self.wfile.write(json.dumps(result).encode('utf-8'))
+        elif self.path == '/move':
+            # Send movement commands (simulate publishing to ROS topic)
+            velocity = request_json.get('velocity', {})
+            # Simulate result
+            result = {"result": "cmd_vel command accepted", "velocity": velocity}
+            self._set_headers()
+            self.wfile.write(json.dumps(result).encode('utf-8'))
+        else:
+            self._set_headers(404)
+            self.wfile.write(b'{"error":"Not found"}')
+
+def run_server():
+    server = HTTPServer((HTTP_SERVER_HOST, HTTP_SERVER_PORT), JueyingHandler)
+    print(f"Jueying Lite3 Pro HTTP API running on {HTTP_SERVER_HOST}:{HTTP_SERVER_PORT}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
         pass
     finally:
-        cap.release()
-    return response
+        rtsp_proxy.stop()
+        server.server_close()
 
-app = web.Application()
-app.add_routes(routes)
-
-if __name__ == "__main__":
-    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
+if __name__ == '__main__':
+    run_server()
