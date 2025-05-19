@@ -1,87 +1,80 @@
 import os
 import asyncio
 import json
-from aiohttp import web
-import aiohttp
+from fastapi import FastAPI, Response, status
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel
+import uvicorn
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 
-ROS_HOST = os.environ.get("ROS_HOST", "localhost")
-ROS_DOMAIN_ID = os.environ.get("ROS_DOMAIN_ID")
-HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
-HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8000"))
-LINEAR_VEL = float(os.environ.get("LINEAR_VEL", "0.3"))
-ANGULAR_VEL = float(os.environ.get("ANGULAR_VEL", "0.5"))
-ODOM_TIMEOUT = float(os.environ.get("ODOM_TIMEOUT", "2.0"))
-
+# ====== ENVIRONMENT VARIABLE CONFIG ======
+ROBOT_ROS_MASTER_URI = os.getenv('ROBOT_ROS_MASTER_URI', 'localhost')
+ROBOT_ROS_NAMESPACE = os.getenv('ROBOT_ROS_NAMESPACE', '')
+SERVER_HOST = os.getenv('SERVER_HOST', '0.0.0.0')
+SERVER_PORT = int(os.getenv('SERVER_PORT', '8080'))
+ODOM_TOPIC = os.getenv('ODOM_TOPIC', '/odom')
+CMD_VEL_TOPIC = os.getenv('CMD_VEL_TOPIC', '/cmd_vel')
+ROS_DOMAIN_ID = os.getenv('ROS_DOMAIN_ID', None)
 if ROS_DOMAIN_ID is not None:
-    os.environ["ROS_DOMAIN_ID"] = ROS_DOMAIN_ID
+    os.environ['ROS_DOMAIN_ID'] = ROS_DOMAIN_ID
 
-rclpy.init()
-
-class CommandNode(Node):
-    def __init__(self):
-        super().__init__('lite3pro_driver_cmd')
-        self.publisher = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.last_odom_msg = None
+# ====== ROS2 NODE SETUP ======
+class RobotCommandNode(Node):
+    def __init__(self, odom_topic, cmd_vel_topic):
+        super().__init__('web_cmd_node')
+        self.cmd_vel_pub = self.create_publisher(Twist, cmd_vel_topic, 10)
+        self.last_odom = None
         self.odom_event = asyncio.Event()
-        self.create_subscription(Odometry, '/odom', self.odom_cb, 10)
+        self.create_subscription(Odometry, odom_topic, self.odom_callback, 10)
 
-    def odom_cb(self, msg):
-        self.last_odom_msg = msg
+    def odom_callback(self, msg):
+        self.last_odom = msg
         self.odom_event.set()
 
-    async def wait_for_odom(self, timeout=2.0):
-        self.odom_event.clear()
-        try:
-            await asyncio.wait_for(self.odom_event.wait(), timeout)
-        except asyncio.TimeoutError:
-            return None
-        return self.last_odom_msg
+    def publish_cmd(self, linear_x=0.0, angular_z=0.0):
+        twist = Twist()
+        twist.linear.x = linear_x
+        twist.angular.z = angular_z
+        self.cmd_vel_pub.publish(twist)
 
-    def send_cmd(self, linear_x=0.0, angular_z=0.0):
-        msg = Twist()
-        msg.linear.x = linear_x
-        msg.angular.z = angular_z
-        self.publisher.publish(msg)
+# ====== FASTAPI SETUP ======
+app = FastAPI()
+rclpy.init(args=None)
+ros_node = RobotCommandNode(ODOM_TOPIC, CMD_VEL_TOPIC)
 
-node = CommandNode()
+# ====== COMMAND MODELS ======
+class CommandResponse(BaseModel):
+    status: str
 
-async def run_ros_spin():
-    while rclpy.ok():
-        rclpy.spin_once(node, timeout_sec=0.1)
-        await asyncio.sleep(0.01)
+@app.post("/move/forward", response_model=CommandResponse)
+async def move_forward():
+    ros_node.publish_cmd(linear_x=0.3, angular_z=0.0)
+    return {"status": "moving forward"}
 
-routes = web.RouteTableDef()
+@app.post("/move/backward", response_model=CommandResponse)
+async def move_backward():
+    ros_node.publish_cmd(linear_x=-0.3, angular_z=0.0)
+    return {"status": "moving backward"}
 
-@routes.post('/move/forward')
-async def move_forward(request):
-    node.send_cmd(linear_x=LINEAR_VEL, angular_z=0.0)
-    return web.json_response({"status": "moving forward"})
+@app.post("/turn/left", response_model=CommandResponse)
+async def turn_left():
+    ros_node.publish_cmd(linear_x=0.0, angular_z=0.5)
+    return {"status": "turning left"}
 
-@routes.post('/move/backward')
-async def move_backward(request):
-    node.send_cmd(linear_x=-LINEAR_VEL, angular_z=0.0)
-    return web.json_response({"status": "moving backward"})
+@app.post("/turn/right", response_model=CommandResponse)
+async def turn_right():
+    ros_node.publish_cmd(linear_x=0.0, angular_z=-0.5)
+    return {"status": "turning right"}
 
-@routes.post('/turn/left')
-async def turn_left(request):
-    node.send_cmd(linear_x=0.0, angular_z=ANGULAR_VEL)
-    return web.json_response({"status": "turning left"})
+@app.post("/stop", response_model=CommandResponse)
+async def stop():
+    ros_node.publish_cmd(linear_x=0.0, angular_z=0.0)
+    return {"status": "stopped"}
 
-@routes.post('/turn/right')
-async def turn_right(request):
-    node.send_cmd(linear_x=0.0, angular_z=-ANGULAR_VEL)
-    return web.json_response({"status": "turning right"})
-
-@routes.post('/stop')
-async def stop(request):
-    node.send_cmd(linear_x=0.0, angular_z=0.0)
-    return web.json_response({"status": "stopped"})
-
-def odom_to_dict(msg):
+def odom_msg_to_dict(msg: Odometry):
     return {
         "header": {
             "stamp": {
@@ -124,31 +117,20 @@ def odom_to_dict(msg):
         }
     }
 
-@routes.get('/odom')
-async def get_odom(request):
-    msg = await node.wait_for_odom(timeout=ODOM_TIMEOUT)
-    if msg is None:
-        return web.json_response({"error": "odom timeout"}, status=504)
-    return web.json_response(odom_to_dict(msg))
-
-app = web.Application()
-app.add_routes(routes)
-
-async def main():
-    loop = asyncio.get_running_loop()
-    ros_task = loop.create_task(run_ros_spin())
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, HTTP_SERVER_HOST, HTTP_SERVER_PORT)
-    await site.start()
+@app.get("/odom")
+async def get_odom():
+    # Wait up to 2s for new odometry data
     try:
-        while True:
-            await asyncio.sleep(3600)
-    except (asyncio.CancelledError, KeyboardInterrupt):
+        await asyncio.wait_for(ros_node.odom_event.wait(), timeout=2.0)
+        ros_node.odom_event.clear()
+    except asyncio.TimeoutError:
         pass
-    finally:
-        await runner.cleanup()
-        rclpy.shutdown()
+    msg = ros_node.last_odom
+    if msg is None:
+        return JSONResponse({"status": "no odom available"}, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+    result = odom_msg_to_dict(msg)
+    return JSONResponse(result)
 
-if __name__ == '__main__':
-    asyncio.run(main())
+# ====== RUNNER ======
+if __name__ == "__main__":
+    uvicorn.run("main:app", host=SERVER_HOST, port=SERVER_PORT, reload=False)
