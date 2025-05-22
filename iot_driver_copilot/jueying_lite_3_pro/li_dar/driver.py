@@ -1,136 +1,92 @@
 import os
-import asyncio
 import json
 from fastapi import FastAPI, Response, status
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
-import rclpy
-from rclpy.node import Node
-from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
+import socket
+import struct
+import threading
+import time
 
-# ====== ENVIRONMENT VARIABLE CONFIG ======
-ROBOT_ROS_MASTER_URI = os.getenv('ROBOT_ROS_MASTER_URI', 'localhost')
-ROBOT_ROS_NAMESPACE = os.getenv('ROBOT_ROS_NAMESPACE', '')
-SERVER_HOST = os.getenv('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.getenv('SERVER_PORT', '8080'))
-ODOM_TOPIC = os.getenv('ODOM_TOPIC', '/odom')
-CMD_VEL_TOPIC = os.getenv('CMD_VEL_TOPIC', '/cmd_vel')
-ROS_DOMAIN_ID = os.getenv('ROS_DOMAIN_ID', None)
-if ROS_DOMAIN_ID is not None:
-    os.environ['ROS_DOMAIN_ID'] = ROS_DOMAIN_ID
+# Environment variables
+ROBOT_IP = os.environ.get("ROBOT_IP", "127.0.0.1")
+ROBOT_UDP_PORT = int(os.environ.get("ROBOT_UDP_PORT", "15000"))
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8000"))
+ROS_TIMEOUT = float(os.environ.get("ROS_TIMEOUT", "2.0"))
 
-# ====== ROS2 NODE SETUP ======
-class RobotCommandNode(Node):
-    def __init__(self, odom_topic, cmd_vel_topic):
-        super().__init__('web_cmd_node')
-        self.cmd_vel_pub = self.create_publisher(Twist, cmd_vel_topic, 10)
-        self.last_odom = None
-        self.odom_event = asyncio.Event()
-        self.create_subscription(Odometry, odom_topic, self.odom_callback, 10)
+# UDP command definitions (example message types)
+COMMANDS = {
+    "move/forward": b"FORWARD",
+    "move/backward": b"BACKWARD",
+    "move/left": b"LEFT",
+    "move/right": b"RIGHT",
+    "move/stop": b"STOP",
+    "move/stop_all": b"STOP_ALL",
+    "move/rotate_left": b"ROTATE_LEFT",
+    "move/rotate_right": b"ROTATE_RIGHT",
+    "stand": b"STAND",
+    "greet": b"GREET",
+    "jump": b"JUMP",
+    "twist": b"TWIST",
+    "emergency_stop": b"ESTOP"
+}
 
-    def odom_callback(self, msg):
-        self.last_odom = msg
-        self.odom_event.set()
+STATUS_REQUEST = b"STATUS"
+# We'll simulate responses as an example
 
-    def publish_cmd(self, linear_x=0.0, angular_z=0.0):
-        twist = Twist()
-        twist.linear.x = linear_x
-        twist.angular.z = angular_z
-        self.cmd_vel_pub.publish(twist)
+# UDP communication helper
+def send_udp_command(command_bytes, expect_response=False):
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(ROS_TIMEOUT)
+        sock.sendto(command_bytes, (ROBOT_IP, ROBOT_UDP_PORT))
+        if expect_response:
+            try:
+                data, _ = sock.recvfrom(8192)
+                return data
+            except socket.timeout:
+                return None
+    return None
 
-# ====== FASTAPI SETUP ======
-app = FastAPI()
-rclpy.init(args=None)
-ros_node = RobotCommandNode(ODOM_TOPIC, CMD_VEL_TOPIC)
+# FastAPI application
+app = FastAPI(title="Jueying Lite3 Pro/LiDAR HTTP Driver")
 
-# ====== COMMAND MODELS ======
-class CommandResponse(BaseModel):
-    status: str
+# API Models (if any payload needed in future, can be extended)
+class EmptyBody(BaseModel):
+    pass
 
-@app.post("/move/forward", response_model=CommandResponse)
-async def move_forward():
-    ros_node.publish_cmd(linear_x=0.3, angular_z=0.0)
-    return {"status": "moving forward"}
-
-@app.post("/move/backward", response_model=CommandResponse)
-async def move_backward():
-    ros_node.publish_cmd(linear_x=-0.3, angular_z=0.0)
-    return {"status": "moving backward"}
-
-@app.post("/turn/left", response_model=CommandResponse)
-async def turn_left():
-    ros_node.publish_cmd(linear_x=0.0, angular_z=0.5)
-    return {"status": "turning left"}
-
-@app.post("/turn/right", response_model=CommandResponse)
-async def turn_right():
-    ros_node.publish_cmd(linear_x=0.0, angular_z=-0.5)
-    return {"status": "turning right"}
-
-@app.post("/stop", response_model=CommandResponse)
-async def stop():
-    ros_node.publish_cmd(linear_x=0.0, angular_z=0.0)
-    return {"status": "stopped"}
-
-def odom_msg_to_dict(msg: Odometry):
-    return {
-        "header": {
-            "stamp": {
-                "sec": msg.header.stamp.sec,
-                "nanosec": msg.header.stamp.nanosec
-            },
-            "frame_id": msg.header.frame_id
-        },
-        "child_frame_id": msg.child_frame_id,
-        "pose": {
-            "pose": {
-                "position": {
-                    "x": msg.pose.pose.position.x,
-                    "y": msg.pose.pose.position.y,
-                    "z": msg.pose.pose.position.z
-                },
-                "orientation": {
-                    "x": msg.pose.pose.orientation.x,
-                    "y": msg.pose.pose.orientation.y,
-                    "z": msg.pose.pose.orientation.z,
-                    "w": msg.pose.pose.orientation.w
-                }
-            },
-            "covariance": list(msg.pose.covariance)
-        },
-        "twist": {
-            "twist": {
-                "linear": {
-                    "x": msg.twist.twist.linear.x,
-                    "y": msg.twist.twist.linear.y,
-                    "z": msg.twist.twist.linear.z
-                },
-                "angular": {
-                    "x": msg.twist.twist.angular.x,
-                    "y": msg.twist.twist.angular.y,
-                    "z": msg.twist.twist.angular.z
-                }
-            },
-            "covariance": list(msg.twist.covariance)
-        }
-    }
-
-@app.get("/odom")
-async def get_odom():
-    # Wait up to 2s for new odometry data
+@app.get("/status", summary="Retrieve current robot status including sensor readings and operational state.")
+def api_status():
+    data = send_udp_command(STATUS_REQUEST, expect_response=True)
+    if data is None:
+        return JSONResponse({"status": "offline", "msg": "No response from robot."}, status_code=status.HTTP_504_GATEWAY_TIMEOUT)
     try:
-        await asyncio.wait_for(ros_node.odom_event.wait(), timeout=2.0)
-        ros_node.odom_event.clear()
-    except asyncio.TimeoutError:
-        pass
-    msg = ros_node.last_odom
-    if msg is None:
-        return JSONResponse({"status": "no odom available"}, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
-    result = odom_msg_to_dict(msg)
-    return JSONResponse(result)
+        # Assume status is sent as JSON bytes
+        status_json = json.loads(data.decode("utf-8"))
+        return JSONResponse(status_json)
+    except Exception:
+        return JSONResponse({"status": "online", "raw": data.hex()}, status_code=status.HTTP_200_OK)
 
-# ====== RUNNER ======
+def make_simple_post_handler(command_key):
+    async def post_handler():
+        send_udp_command(COMMANDS[command_key])
+        return JSONResponse({"status": "ok", "command": command_key})
+    return post_handler
+
+app.post("/move/forward", summary="Command the robot to move forward. Users can issue this command to initiate forward movement.")(make_simple_post_handler("move/forward"))
+app.post("/move/backward", summary="Command the robot to move backward. Use this endpoint to start reverse motion.")(make_simple_post_handler("move/backward"))
+app.post("/move/left", summary="Instruct the robot to sidestep to the left. Ideal for lateral adjustments.")(make_simple_post_handler("move/left"))
+app.post("/move/right", summary="Instruct the robot to sidestep to the right for lateral maneuvering.")(make_simple_post_handler("move/right"))
+app.post("/move/stop", summary="Halt the robot's current movement. Use this command for immediate stop of the active motion.")(make_simple_post_handler("move/stop"))
+app.post("/move/stop_all", summary="Stop all ongoing robot actions immediately. This endpoint ensures that every movement ceases.")(make_simple_post_handler("move/stop_all"))
+app.post("/move/rotate_left", summary="Rotate the robot to the left. Utilize this endpoint to adjust the robot’s orientation gradually.")(make_simple_post_handler("move/rotate_left"))
+app.post("/move/rotate_right", summary="Rotate the robot to the right. Users employ this command to change the robot's facing direction.")(make_simple_post_handler("move/rotate_right"))
+app.post("/stand", summary="Command the robot to stand upright, setting it into a neutral posture for further operations.")(make_simple_post_handler("stand"))
+app.post("/greet", summary="Trigger a greeting sequence where the robot performs a welcoming gesture.")(make_simple_post_handler("greet"))
+app.post("/jump", summary="Command the robot to perform a jump, demonstrating agility when needed.")(make_simple_post_handler("jump"))
+app.post("/twist", summary="Instruct the robot to execute a twisting motion, showcasing dynamic maneuver capabilities.")(make_simple_post_handler("twist"))
+app.post("/emergency_stop", summary="Engage the emergency stop to immediately cut off all commands and halt any movement.")(make_simple_post_handler("emergency_stop"))
+
 if __name__ == "__main__":
-    uvicorn.run("main:app", host=SERVER_HOST, port=SERVER_PORT, reload=False)
+    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)
