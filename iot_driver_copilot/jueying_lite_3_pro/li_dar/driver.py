@@ -1,92 +1,117 @@
 import os
-import json
-from fastapi import FastAPI, Response, status
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-import uvicorn
 import socket
 import struct
 import threading
-import time
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# Environment variables
-ROBOT_IP = os.environ.get("ROBOT_IP", "127.0.0.1")
-ROBOT_UDP_PORT = int(os.environ.get("ROBOT_UDP_PORT", "15000"))
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8000"))
-ROS_TIMEOUT = float(os.environ.get("ROS_TIMEOUT", "2.0"))
+# Configuration from environment variables
+ROBOT_IP = os.environ.get('ROBOT_IP', '192.168.123.10')
+ROBOT_UDP_PORT = int(os.environ.get('ROBOT_UDP_PORT', '8001'))  # UDP port for commands/status
+HTTP_HOST = os.environ.get('HTTP_HOST', '0.0.0.0')
+HTTP_PORT = int(os.environ.get('HTTP_PORT', '8080'))
 
-# UDP command definitions (example message types)
+# UDP socket setup (thread-safe)
+udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+udp_sock.settimeout(2)
+
+# Robot command mapping
 COMMANDS = {
-    "move/forward": b"FORWARD",
-    "move/backward": b"BACKWARD",
-    "move/left": b"LEFT",
-    "move/right": b"RIGHT",
-    "move/stop": b"STOP",
-    "move/stop_all": b"STOP_ALL",
-    "move/rotate_left": b"ROTATE_LEFT",
-    "move/rotate_right": b"ROTATE_RIGHT",
-    "stand": b"STAND",
-    "greet": b"GREET",
-    "jump": b"JUMP",
-    "twist": b"TWIST",
-    "emergency_stop": b"ESTOP"
+    "move/forward": b'CMD_FORWARD',
+    "move/backward": b'CMD_BACKWARD',
+    "move/left": b'CMD_LEFT',
+    "move/right": b'CMD_RIGHT',
+    "move/stop": b'CMD_STOP',
+    "move/stop_all": b'CMD_STOP_ALL',
+    "move/rotate_left": b'CMD_ROTATE_LEFT',
+    "move/rotate_right": b'CMD_ROTATE_RIGHT',
+    "stand": b'CMD_STAND',
+    "hello": b'CMD_GREET',
+    "jump": b'CMD_JUMP',
+    "twist": b'CMD_TWIST',
+    "e_stop": b'CMD_ESTOP'
 }
 
-STATUS_REQUEST = b"STATUS"
-# We'll simulate responses as an example
+STATUS_REQUEST = b'REQ_STATUS'
 
-# UDP communication helper
-def send_udp_command(command_bytes, expect_response=False):
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.settimeout(ROS_TIMEOUT)
-        sock.sendto(command_bytes, (ROBOT_IP, ROBOT_UDP_PORT))
-        if expect_response:
-            try:
-                data, _ = sock.recvfrom(8192)
-                return data
-            except socket.timeout:
-                return None
-    return None
-
-# FastAPI application
-app = FastAPI(title="Jueying Lite3 Pro/LiDAR HTTP Driver")
-
-# API Models (if any payload needed in future, can be extended)
-class EmptyBody(BaseModel):
-    pass
-
-@app.get("/status", summary="Retrieve current robot status including sensor readings and operational state.")
-def api_status():
-    data = send_udp_command(STATUS_REQUEST, expect_response=True)
-    if data is None:
-        return JSONResponse({"status": "offline", "msg": "No response from robot."}, status_code=status.HTTP_504_GATEWAY_TIMEOUT)
+def send_udp_command(cmd_bytes):
     try:
-        # Assume status is sent as JSON bytes
-        status_json = json.loads(data.decode("utf-8"))
-        return JSONResponse(status_json)
-    except Exception:
-        return JSONResponse({"status": "online", "raw": data.hex()}, status_code=status.HTTP_200_OK)
+        udp_sock.sendto(cmd_bytes, (ROBOT_IP, ROBOT_UDP_PORT))
+        # For commands, we can just return OK
+        return True, None
+    except Exception as e:
+        return False, str(e)
 
-def make_simple_post_handler(command_key):
-    async def post_handler():
-        send_udp_command(COMMANDS[command_key])
-        return JSONResponse({"status": "ok", "command": command_key})
-    return post_handler
+def request_status():
+    try:
+        udp_sock.sendto(STATUS_REQUEST, (ROBOT_IP, ROBOT_UDP_PORT))
+        data, _ = udp_sock.recvfrom(4096)
+        # Try to decode as JSON, else fallback to raw
+        try:
+            status = json.loads(data.decode('utf-8'))
+        except Exception:
+            status = {"raw_status": data.hex()}
+        return status
+    except Exception as e:
+        return {"error": str(e)}
 
-app.post("/move/forward", summary="Command the robot to move forward. Users can issue this command to initiate forward movement.")(make_simple_post_handler("move/forward"))
-app.post("/move/backward", summary="Command the robot to move backward. Use this endpoint to start reverse motion.")(make_simple_post_handler("move/backward"))
-app.post("/move/left", summary="Instruct the robot to sidestep to the left. Ideal for lateral adjustments.")(make_simple_post_handler("move/left"))
-app.post("/move/right", summary="Instruct the robot to sidestep to the right for lateral maneuvering.")(make_simple_post_handler("move/right"))
-app.post("/move/stop", summary="Halt the robot's current movement. Use this command for immediate stop of the active motion.")(make_simple_post_handler("move/stop"))
-app.post("/move/stop_all", summary="Stop all ongoing robot actions immediately. This endpoint ensures that every movement ceases.")(make_simple_post_handler("move/stop_all"))
-app.post("/move/rotate_left", summary="Rotate the robot to the left. Utilize this endpoint to adjust the robot’s orientation gradually.")(make_simple_post_handler("move/rotate_left"))
-app.post("/move/rotate_right", summary="Rotate the robot to the right. Users employ this command to change the robot's facing direction.")(make_simple_post_handler("move/rotate_right"))
-app.post("/stand", summary="Command the robot to stand upright, setting it into a neutral posture for further operations.")(make_simple_post_handler("stand"))
-app.post("/greet", summary="Trigger a greeting sequence where the robot performs a welcoming gesture.")(make_simple_post_handler("greet"))
-app.post("/jump", summary="Command the robot to perform a jump, demonstrating agility when needed.")(make_simple_post_handler("jump"))
-app.post("/twist", summary="Instruct the robot to execute a twisting motion, showcasing dynamic maneuver capabilities.")(make_simple_post_handler("twist"))
-app.post("/emergency_stop", summary="Engage the emergency stop to immediately cut off all commands and halt any movement.")(make_simple_post_handler("emergency_stop"))
+class RobotDriverHandler(BaseHTTPRequestHandler):
+    def _set_headers(self, code=200, content_type='application/json'):
+        self.send_response(code)
+        self.send_header('Content-type', content_type)
+        self.end_headers()
+
+    def _json_response(self, payload, code=200):
+        self._set_headers(code)
+        self.wfile.write(json.dumps(payload).encode('utf-8'))
+
+    def do_GET(self):
+        if self.path == "/status":
+            status = request_status()
+            self._json_response(status)
+        else:
+            self._json_response({"error": "not found"}, code=404)
+
+    def do_POST(self):
+        path = self.path.rstrip('/')
+        action_map = {
+            '/move/forward': "move/forward",
+            '/move/backward': "move/backward",
+            '/move/left': "move/left",
+            '/move/right': "move/right",
+            '/move/stop': "move/stop",
+            '/move/stop_all': "move/stop_all",
+            '/move/rotate_left': "move/rotate_left",
+            '/move/rotate_right': "move/rotate_right",
+            '/stand': "stand",
+            '/hello': "hello",
+            '/jump': "jump",
+            '/twist': "twist",
+            '/e_stop': "e_stop",
+            '/greet': "hello",
+        }
+        if path in action_map:
+            cmd_key = action_map[path]
+            cmd_bytes = COMMANDS.get(cmd_key)
+            if not cmd_bytes:
+                self._json_response({'error': 'Command not implemented'}, code=501)
+                return
+            ok, err = send_udp_command(cmd_bytes)
+            if ok:
+                self._json_response({'result': 'ok', 'command': cmd_key})
+            else:
+                self._json_response({'error': err}, code=500)
+        else:
+            self._json_response({'error': 'not found'}, code=404)
+
+    def log_message(self, format, *args):
+        # Suppress logging, or redirect as needed
+        return
+
+def run_server():
+    server = HTTPServer((HTTP_HOST, HTTP_PORT), RobotDriverHandler)
+    print(f"Robot driver HTTP server running at http://{HTTP_HOST}:{HTTP_PORT}")
+    server.serve_forever()
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)
+    run_server()
