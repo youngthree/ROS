@@ -1,117 +1,98 @@
 import os
-import socket
-import struct
-import threading
 import json
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import socket
+from flask import Flask, request, jsonify
 
-# Configuration from environment variables
-ROBOT_IP = os.environ.get('ROBOT_IP', '192.168.123.10')
-ROBOT_UDP_PORT = int(os.environ.get('ROBOT_UDP_PORT', '8001'))  # UDP port for commands/status
-HTTP_HOST = os.environ.get('HTTP_HOST', '0.0.0.0')
-HTTP_PORT = int(os.environ.get('HTTP_PORT', '8080'))
+# Read configuration from environment variables
+DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
+DEVICE_UDP_PORT = int(os.environ.get("DEVICE_UDP_PORT", "6000"))
+HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
+HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
+UDP_TIMEOUT = float(os.environ.get("DEVICE_UDP_TIMEOUT", "2.0"))
 
-# UDP socket setup (thread-safe)
-udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-udp_sock.settimeout(2)
-
-# Robot command mapping
-COMMANDS = {
-    "move/forward": b'CMD_FORWARD',
-    "move/backward": b'CMD_BACKWARD',
-    "move/left": b'CMD_LEFT',
-    "move/right": b'CMD_RIGHT',
-    "move/stop": b'CMD_STOP',
-    "move/stop_all": b'CMD_STOP_ALL',
-    "move/rotate_left": b'CMD_ROTATE_LEFT',
-    "move/rotate_right": b'CMD_ROTATE_RIGHT',
-    "stand": b'CMD_STAND',
-    "hello": b'CMD_GREET',
-    "jump": b'CMD_JUMP',
-    "twist": b'CMD_TWIST',
-    "e_stop": b'CMD_ESTOP'
+# UDP message formats for each command
+COMMAND_MAP = {
+    "/move/forward": {
+        "cmd": "move_forward",
+        "payload_keys": ["speed", "duration"]
+    },
+    "/move/backward": {
+        "cmd": "move_backward",
+        "payload_keys": ["speed", "duration"]
+    },
+    "/turn/left": {
+        "cmd": "turn_left",
+        "payload_keys": ["angle", "speed"]
+    },
+    "/turn/right": {
+        "cmd": "turn_right",
+        "payload_keys": ["angle", "speed"]
+    },
+    "/stop": {
+        "cmd": "stop",
+        "payload_keys": []
+    }
 }
 
-STATUS_REQUEST = b'REQ_STATUS'
-
-def send_udp_command(cmd_bytes):
+def send_udp_command(command: str, payload: dict = None):
+    """
+    Send a command via UDP to the robot and wait for a response.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(UDP_TIMEOUT)
     try:
-        udp_sock.sendto(cmd_bytes, (ROBOT_IP, ROBOT_UDP_PORT))
-        # For commands, we can just return OK
-        return True, None
-    except Exception as e:
-        return False, str(e)
-
-def request_status():
-    try:
-        udp_sock.sendto(STATUS_REQUEST, (ROBOT_IP, ROBOT_UDP_PORT))
-        data, _ = udp_sock.recvfrom(4096)
-        # Try to decode as JSON, else fallback to raw
+        # Compose the message as JSON
+        message = {"command": command}
+        if payload:
+            message.update(payload)
+        msg_bytes = json.dumps(message).encode("utf-8")
+        sock.sendto(msg_bytes, (DEVICE_IP, DEVICE_UDP_PORT))
+        resp, _ = sock.recvfrom(4096)
         try:
-            status = json.loads(data.decode('utf-8'))
+            return json.loads(resp.decode("utf-8"))
         except Exception:
-            status = {"raw_status": data.hex()}
-        return status
+            return {"status": "ok", "raw_response": resp.decode("utf-8", errors="ignore")}
+    except socket.timeout:
+        return {"status": "error", "error": "No response from device"}
     except Exception as e:
-        return {"error": str(e)}
+        return {"status": "error", "error": str(e)}
+    finally:
+        sock.close()
 
-class RobotDriverHandler(BaseHTTPRequestHandler):
-    def _set_headers(self, code=200, content_type='application/json'):
-        self.send_response(code)
-        self.send_header('Content-type', content_type)
-        self.end_headers()
+app = Flask(__name__)
 
-    def _json_response(self, payload, code=200):
-        self._set_headers(code)
-        self.wfile.write(json.dumps(payload).encode('utf-8'))
+@app.route("/move/forward", methods=["POST"])
+def move_forward():
+    payload = request.get_json(silent=True) or {}
+    send_payload = {k: payload[k] for k in COMMAND_MAP["/move/forward"]["payload_keys"] if k in payload}
+    result = send_udp_command(COMMAND_MAP["/move/forward"]["cmd"], send_payload)
+    return jsonify(result)
 
-    def do_GET(self):
-        if self.path == "/status":
-            status = request_status()
-            self._json_response(status)
-        else:
-            self._json_response({"error": "not found"}, code=404)
+@app.route("/move/backward", methods=["POST"])
+def move_backward():
+    payload = request.get_json(silent=True) or {}
+    send_payload = {k: payload[k] for k in COMMAND_MAP["/move/backward"]["payload_keys"] if k in payload}
+    result = send_udp_command(COMMAND_MAP["/move/backward"]["cmd"], send_payload)
+    return jsonify(result)
 
-    def do_POST(self):
-        path = self.path.rstrip('/')
-        action_map = {
-            '/move/forward': "move/forward",
-            '/move/backward': "move/backward",
-            '/move/left': "move/left",
-            '/move/right': "move/right",
-            '/move/stop': "move/stop",
-            '/move/stop_all': "move/stop_all",
-            '/move/rotate_left': "move/rotate_left",
-            '/move/rotate_right': "move/rotate_right",
-            '/stand': "stand",
-            '/hello': "hello",
-            '/jump': "jump",
-            '/twist': "twist",
-            '/e_stop': "e_stop",
-            '/greet': "hello",
-        }
-        if path in action_map:
-            cmd_key = action_map[path]
-            cmd_bytes = COMMANDS.get(cmd_key)
-            if not cmd_bytes:
-                self._json_response({'error': 'Command not implemented'}, code=501)
-                return
-            ok, err = send_udp_command(cmd_bytes)
-            if ok:
-                self._json_response({'result': 'ok', 'command': cmd_key})
-            else:
-                self._json_response({'error': err}, code=500)
-        else:
-            self._json_response({'error': 'not found'}, code=404)
+@app.route("/turn/left", methods=["POST"])
+def turn_left():
+    payload = request.get_json(silent=True) or {}
+    send_payload = {k: payload[k] for k in COMMAND_MAP["/turn/left"]["payload_keys"] if k in payload}
+    result = send_udp_command(COMMAND_MAP["/turn/left"]["cmd"], send_payload)
+    return jsonify(result)
 
-    def log_message(self, format, *args):
-        # Suppress logging, or redirect as needed
-        return
+@app.route("/turn/right", methods=["POST"])
+def turn_right():
+    payload = request.get_json(silent=True) or {}
+    send_payload = {k: payload[k] for k in COMMAND_MAP["/turn/right"]["payload_keys"] if k in payload}
+    result = send_udp_command(COMMAND_MAP["/turn/right"]["cmd"], send_payload)
+    return jsonify(result)
 
-def run_server():
-    server = HTTPServer((HTTP_HOST, HTTP_PORT), RobotDriverHandler)
-    print(f"Robot driver HTTP server running at http://{HTTP_HOST}:{HTTP_PORT}")
-    server.serve_forever()
+@app.route("/stop", methods=["POST"])
+def stop():
+    result = send_udp_command(COMMAND_MAP["/stop"]["cmd"])
+    return jsonify(result)
 
 if __name__ == "__main__":
-    run_server()
+    app.run(host=HTTP_HOST, port=HTTP_PORT)
