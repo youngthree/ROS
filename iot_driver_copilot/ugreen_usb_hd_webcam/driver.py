@@ -1,123 +1,108 @@
 import os
-from flask import Flask, Response, jsonify, send_file
-import threading
-import queue
-import paho.mqtt.client as mqtt
 import io
+import cv2
 import time
 import json
-from werkzeug.exceptions import ServiceUnavailable
+import threading
+from flask import Flask, Response, jsonify, send_file
 
 app = Flask(__name__)
 
-# Environment variable configuration
-MQTT_BROKER_ADDRESS = os.environ.get("MQTT_BROKER_ADDRESS")
-if not MQTT_BROKER_ADDRESS:
-    raise EnvironmentError("MQTT_BROKER_ADDRESS environment variable is required")
+# Configuration from environment variables
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+WEBCAM_INDEX = int(os.environ.get("WEBCAM_INDEX", "0"))  # USB webcam index
+VIDEO_FPS = int(os.environ.get("VIDEO_FPS", "15"))
 
-MQTT_CLIENT_ID = os.environ.get("MQTT_CLIENT_ID", "webcam_shifu")
-MQTT_USERNAME = os.environ.get("MQTT_USERNAME")
-MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD")
-MQTT_KEEPALIVE = int(os.environ.get("MQTT_KEEPALIVE", "60"))
+class WebcamStream:
+    def __init__(self, index):
+        self.index = index
+        self.capture = None
+        self.lock = threading.Lock()
+        self.is_opened = False
+        self.last_frame = None
+        self.last_read_time = 0
+        self.open()
 
-TOPIC_VIDEO = "device/webcam/video"
-TOPIC_CAPTURE = "device/webcam/capture"
-TOPIC_PROBE = "device/webcam/probe"
+    def open(self):
+        with self.lock:
+            if self.capture is None or not self.capture.isOpened():
+                self.capture = cv2.VideoCapture(self.index)
+                self.is_opened = self.capture.isOpened()
 
-# Internal queues for MQTT messages
-video_queue = queue.Queue(maxsize=10)
-capture_queue = queue.Queue(maxsize=1)
-probe_queue = queue.Queue(maxsize=1)
+    def close(self):
+        with self.lock:
+            if self.capture is not None:
+                self.capture.release()
+                self.capture = None
+                self.is_opened = False
 
-# MQTT callbacks
-def on_connect(client, userdata, flags, rc):
-    # Subscribe to all topics on connect
-    client.subscribe([(TOPIC_VIDEO, 1), (TOPIC_CAPTURE, 1), (TOPIC_PROBE, 1)])
+    def read(self):
+        with self.lock:
+            if not self.capture or not self.capture.isOpened():
+                self.open()
+            if self.capture and self.capture.isOpened():
+                ret, frame = self.capture.read()
+                if ret:
+                    self.last_frame = frame
+                    self.last_read_time = time.time()
+                    return frame
+                else:
+                    self.is_opened = False
+            return None
 
-def on_message(client, userdata, msg):
-    if msg.topic == TOPIC_VIDEO:
-        # For video streaming, keep only last N frames to avoid memory bloat
-        try:
-            video_queue.put_nowait(msg.payload)
-        except queue.Full:
-            try:
-                video_queue.get_nowait()
-            except queue.Empty:
-                pass
-            video_queue.put_nowait(msg.payload)
-    elif msg.topic == TOPIC_CAPTURE:
-        # For capture, keep only the latest image
-        while not capture_queue.empty():
-            capture_queue.get_nowait()
-        capture_queue.put_nowait(msg.payload)
-    elif msg.topic == TOPIC_PROBE:
-        # For probe/status, keep only the latest status
-        while not probe_queue.empty():
-            probe_queue.get_nowait()
-        probe_queue.put_nowait(msg.payload)
+    def get_status(self):
+        with self.lock:
+            status = {
+                "device_name": "UGREEN USB HD Webcam",
+                "device_model": "CM678",
+                "manufacturer": "UGREEN",
+                "device_type": "Webcam",
+                "opened": self.capture.isOpened() if self.capture else False,
+                "last_read": self.last_read_time,
+                "video_fps": VIDEO_FPS,
+                "webcam_index": self.index
+            }
+            return status
 
-# MQTT client setup
-def mqtt_thread():
-    client = mqtt.Client(client_id=MQTT_CLIENT_ID)
-    if MQTT_USERNAME:
-        client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-    client.on_connect = on_connect
-    client.on_message = on_message
+webcam = WebcamStream(WEBCAM_INDEX)
 
-    broker_host, broker_port = MQTT_BROKER_ADDRESS.rsplit(":", 1)
-    client.connect(broker_host, int(broker_port), keepalive=MQTT_KEEPALIVE)
-    client.loop_forever()
-
-mqtt_bg_thread = threading.Thread(target=mqtt_thread, daemon=True)
-mqtt_bg_thread.start()
-
-# Flask endpoints
-
-@app.route("/video", methods=["GET"])
-def get_video():
-    def generate():
-        boundary = "frame"
-        # Start MJPEG multipart stream
+@app.route('/video', methods=['GET'])
+def video_stream():
+    def gen_frames():
         while True:
-            try:
-                frame = video_queue.get(timeout=10)
-                yield (b'--' + boundary.encode() + b'\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' +
-                       frame + b'\r\n')
-            except queue.Empty:
-                break
-    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+            frame = webcam.read()
+            if frame is not None:
+                ret, jpeg = cv2.imencode('.jpg', frame)
+                if ret:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+            else:
+                # Wait and retry if frame is not available
+                time.sleep(0.1)
+            time.sleep(1.0 / VIDEO_FPS)
+    return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-@app.route("/capture", methods=["GET"])
-def get_capture():
-    try:
-        image_data = capture_queue.get(timeout=5)
-        # Try to guess image format from first bytes
-        if image_data[:8] == b"\x89PNG\r\n\x1a\n":
-            mimetype = "image/png"
-            ext = "png"
-        elif image_data[:2] == b"\xff\xd8":
-            mimetype = "image/jpeg"
-            ext = "jpg"
-        else:
-            mimetype = "application/octet-stream"
-            ext = "bin"
-        return Response(image_data, mimetype=mimetype,
-                        headers={"Content-Disposition": f"inline; filename=capture.{ext}"})
-    except queue.Empty:
-        raise ServiceUnavailable("No capture image available from webcam.")
+@app.route('/capture', methods=['GET'])
+def capture_image():
+    frame = webcam.read()
+    if frame is None:
+        return jsonify({"error": "Unable to capture image from webcam"}), 500
+    ret, jpeg = cv2.imencode('.jpg', frame)
+    if not ret:
+        return jsonify({"error": "Failed to encode image"}), 500
+    return Response(jpeg.tobytes(), mimetype='image/jpeg')
 
-@app.route("/probe", methods=["GET"])
-def get_probe():
-    try:
-        status_data = probe_queue.get(timeout=5)
-        # Should be JSON
-        status_json = json.loads(status_data.decode("utf-8"))
-        return jsonify(status_json)
-    except queue.Empty:
-        raise ServiceUnavailable("No probe/status data available from webcam.")
-    except Exception:
-        raise ServiceUnavailable("Invalid probe/status data received.")
+@app.route('/probe', methods=['GET'])
+def probe_status():
+    status = webcam.get_status()
+    return jsonify(status)
+
+def cleanup():
+    webcam.close()
+
+import atexit
+atexit.register(cleanup)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("SHIFU_DRIVER_PORT", "8080")))
+    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
